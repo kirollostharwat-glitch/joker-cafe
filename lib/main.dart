@@ -23,7 +23,7 @@ class JokerCafeApp extends StatelessWidget {
           secondary: Color(0xFF10B981),
           surface: Color(0xFF181822),
         ),
-        cardTheme: CardTheme(
+        cardTheme: CardThemeData(
           color: const Color(0xFF181822),
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(16),
