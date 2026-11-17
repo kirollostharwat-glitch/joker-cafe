@@ -26,6 +26,7 @@ jobs:
       - uses: subosito/flutter-action@v2
       - run: |
           flutter create . --platforms=android
+          sed -i 's/<application/<uses-permission android:name="android.permission.INTERNET"\/><application/' android/app/src/main/AndroidManifest.xml
           flutter pub get
           flutter build apk --release
       - uses: actions/upload-artifact@v4
