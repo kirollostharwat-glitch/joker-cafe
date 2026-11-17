@@ -521,7 +521,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
               Wrap(
                 spacing: 8,
                 children:
-                    table.drinks.map((d) => Chip(label: Text('${d.name} ×${d.qty}'))).toList(),
+                    table.drinks.map((d) => Chip(label: Text('${d.name} × ${d.qty}'))).toList(),
               ),
             ],
             const SizedBox(height: 14),
@@ -796,7 +796,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   spacing: 8,
                   children: posCart
                       .map((c) => Chip(
-                            label: Text('${c.name} ×${c.qty}'),
+                            label: Text('${c.name} × ${c.qty}'),
                             onDeleted: () {
                               setState(() {
                                 final m = menuItems.firstWhere((it) => it.name == c.name);
@@ -861,7 +861,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
           child: ListTile(
             leading: Icon(s.tableHours > 0 ? Icons.sports_esports : Icons.local_cafe,
                 color: const Color(0xFF7C3AED)),
-            title: Text('${s.source} •${s.total.toStringAsFixed(0)} ج.م',
+            title: Text('${s.source} • ${s.total.toStringAsFixed(0)} ج.م',
                 style: const TextStyle(fontWeight: FontWeight.bold)),
             subtitle: Text(s.details),
             trailing: Text(timeStr, style: const TextStyle(color: Colors.grey, fontSize: 12)),
@@ -953,7 +953,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
         ...menuItems.map((item) => Card(
               child: ListTile(
                 title: Text(item.name, style: const TextStyle(fontWeight: FontWeight.bold)),
-                subtitle: Text('السعر: ${item.price} ج.م \vert{} المخزون: ${item.stock}'),
+                subtitle: Text('السعر: ${item.price} ج.م | المخزون: ${item.stock}'),
                 trailing: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
@@ -1030,4 +1030,45 @@ class _DashboardScreenState extends State<DashboardScreen> {
               TextField(
                   controller: priceCtrl,
                   keyboardType: TextInputType.number,
-                  decoration: const InputDecoration
+                  decoration: const InputDecoration(labelText: 'السعر')),
+              TextField(
+                  controller: stockCtrl,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration(labelText: 'الكمية بالمخزن')),
+            ],
+          ),
+          actions: [
+            ElevatedButton(
+              onPressed: () async {
+                final price = double.tryParse(priceCtrl.text) ?? 0;
+                final stock = int.tryParse(stockCtrl.text) ?? 0;
+                if (nameCtrl.text.isNotEmpty && price > 0) {
+                  final id = existing?.id ?? DateTime.now().millisecondsSinceEpoch.toString();
+                  final item = MenuItem(
+                    id: id,
+                    name: nameCtrl.text,
+                    category: existing?.category ?? 'مشروبات',
+                    price: price,
+                    stock: stock,
+                  );
+                  setState(() {
+                    if (existing == null) {
+                      menuItems.add(item);
+                    } else {
+                      existing.name = item.name;
+                      existing.price = item.price;
+                      existing.stock = item.stock;
+                    }
+                  });
+                  Navigator.pop(ctx);
+                  await FirestoreRestService.setDoc('menu_items', id, item.toMap());
+                }
+              },
+              child: const Text('حفظ'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
