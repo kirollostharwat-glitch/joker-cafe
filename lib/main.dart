@@ -48,24 +48,28 @@ class FirestoreRestService {
   static const String baseUrl =
       'https://firestore.googleapis.com/v1/projects/$projectId/databases/(default)/documents';
 
-  static dynamic _fromFirestoreValue(Map<String, dynamic> val) {
+  static dynamic fromFs(Map<String, dynamic> val) {
     if (val.containsKey('stringValue')) return val['stringValue'];
-    if (val.containsKey('integerValue')) return int.tryParse(val['integerValue'].toString()) ?? 0;
-    if (val.containsKey('doubleValue')) return (val['doubleValue'] as num).toDouble();
+    if (val.containsKey('integerValue')) {
+      return int.tryParse(val['integerValue'].toString()) ?? 0;
+    }
+    if (val.containsKey('doubleValue')) {
+      return (val['doubleValue'] as num).toDouble();
+    }
     if (val.containsKey('booleanValue')) return val['booleanValue'];
     if (val.containsKey('nullValue')) return null;
     if (val.containsKey('arrayValue')) {
       final values = val['arrayValue']['values'] as List? ?? [];
-      return values.map((e) => _fromFirestoreValue(e)).toList();
+      return values.map((e) => fromFs(Map<String, dynamic>.from(e))).toList();
     }
     if (val.containsKey('mapValue')) {
       final fields = val['mapValue']['fields'] as Map<String, dynamic>? ?? {};
-      return fields.map((k, v) => MapEntry(k, _fromFirestoreValue(v)));
+      return fields.map((k, v) => MapEntry(k, fromFs(Map<String, dynamic>.from(v))));
     }
     return null;
   }
 
-  static Map<String, dynamic> _toFirestoreValue(dynamic val) {
+  static Map<String, dynamic> toFs(dynamic val) {
     if (val == null) return {'nullValue': null};
     if (val is String) return {'stringValue': val};
     if (val is int) return {'integerValue': val.toString()};
@@ -73,13 +77,13 @@ class FirestoreRestService {
     if (val is bool) return {'booleanValue': val};
     if (val is List) {
       return {
-        'arrayValue': {'values': val.map((e) => _toFirestoreValue(e)).toList()}
+        'arrayValue': {'values': val.map((e) => toFs(e)).toList()}
       };
     }
     if (val is Map) {
       return {
         'mapValue': {
-          'fields': val.map((k, v) => MapEntry(k.toString(), _toFirestoreValue(v)))
+          'fields': val.map((k, v) => MapEntry(k.toString(), toFs(v)))
         }
       };
     }
@@ -96,7 +100,7 @@ class FirestoreRestService {
         final nameParts = (d['name'] as String).split('/');
         final id = nameParts.last;
         final fields = d['fields'] as Map<String, dynamic>? ?? {};
-        final map = fields.map((k, v) => MapEntry(k, _fromFirestoreValue(v)));
+        final map = fields.map((k, v) => MapEntry(k, fromFs(Map<String, dynamic>.from(v))));
         map['_docId'] = id;
         return map;
       }).toList();
@@ -108,7 +112,7 @@ class FirestoreRestService {
   static Future<void> setDoc(String col, String docId, Map<String, dynamic> data) async {
     final cleanData = Map<String, dynamic>.from(data)..remove('_docId');
     final body = jsonEncode({
-      'fields': cleanData.map((k, v) => MapEntry(k, _toFirestoreValue(v))),
+      'fields': cleanData.map((k, v) => MapEntry(k, toFs(v))),
     });
     await http.patch(
       Uri.parse('$baseUrl/$col/$docId'),
@@ -208,7 +212,8 @@ class GameTable {
   bool get isTimeUp =>
       isRunning && limitMinutes != null && elapsedSeconds >= (limitMinutes! * 60);
 
-  factory GameTable.fromMap(Map<String, dynamic> m, String fallbackId, String fallbackName, double fallbackRate) {
+  factory GameTable.fromMap(
+      Map<String, dynamic> m, String fallbackId, String fallbackName, double fallbackRate) {
     final rawDrinks = m['drinks'] as List? ?? [];
     return GameTable(
       id: m['_docId'] ?? fallbackId,
@@ -259,7 +264,8 @@ class SaleRecord {
         tableHours: (m['tableHours'] as num? ?? 0).toDouble(),
         drinksRevenue: (m['drinksRevenue'] as num? ?? 0).toDouble(),
         details: m['details'] ?? '',
-        createdAtMs: (m['createdAtMs'] as num? ?? DateTime.now().millisecondsSinceEpoch).toInt(),
+        createdAtMs:
+            (m['createdAtMs'] as num? ?? DateTime.now().millisecondsSinceEpoch).toInt(),
       );
 
   Map<String, dynamic> toMap() => {
@@ -336,9 +342,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
         for (final doc in tablesDocs) {
           if (doc['_docId'] == 'billiard_table') {
-            billiardTable = GameTable.fromMap(doc, 'billiard_table', 'ترابيزة البلياردو', 60);
+            billiardTable =
+                GameTable.fromMap(doc, 'billiard_table', 'ترابيزة البلياردو', 60);
           } else if (doc['_docId'] == 'ping_pong_table') {
-            pingPongTable = GameTable.fromMap(doc, 'ping_pong_table', 'ترابيزة البنج بونج', 40);
+            pingPongTable =
+                GameTable.fromMap(doc, 'ping_pong_table', 'ترابيزة البنج بونج', 40);
           }
         }
 
@@ -426,7 +434,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
               ),
               child: Text(
                 'اليوم: ${_todaySalesTotal.toStringAsFixed(0)} ج.م',
-                style: const TextStyle(color: Color(0xFF10B981), fontWeight: FontWeight.bold, fontSize: 13),
+                style: const TextStyle(
+                    color: Color(0xFF10B981), fontWeight: FontWeight.bold, fontSize: 13),
               ),
             ),
             const SizedBox(width: 8),
@@ -479,7 +488,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
               children: [
                 Icon(icon, color: accent, size: 28),
                 const SizedBox(width: 10),
-                Text(table.name, style: const TextStyle(fontSize: 19, fontWeight: FontWeight.bold)),
+                Text(table.name,
+                    style: const TextStyle(fontSize: 19, fontWeight: FontWeight.bold)),
                 const Spacer(),
                 Chip(label: Text('${table.hourlyRate.toStringAsFixed(0)} ج.م / ساعة')),
               ],
@@ -494,7 +504,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
               ),
             ),
             if (table.isTimeUp)
-              const Text('انتهى الوقت المحدد!', style: TextStyle(color: Colors.redAccent, fontWeight: FontWeight.bold)),
+              const Text('انتهى الوقت المحدد!',
+                  style: TextStyle(color: Colors.redAccent, fontWeight: FontWeight.bold)),
             const SizedBox(height: 10),
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceAround,
@@ -509,7 +520,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
               const Divider(height: 20),
               Wrap(
                 spacing: 8,
-                children: table.drinks.map((d) => Chip(label: Text('${d.name} × ${d.qty}'))).toList(),
+                children:
+                    table.drinks.map((d) => Chip(label: Text('${d.name} ×${d.qty}'))).toList(),
               ),
             ],
             const SizedBox(height: 14),
@@ -518,16 +530,21 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 if (!table.isRunning)
                   Expanded(
                     child: ElevatedButton.icon(
-                      style: ElevatedButton.styleFrom(backgroundColor: accent, padding: const EdgeInsets.symmetric(vertical: 12)),
+                      style: ElevatedButton.styleFrom(
+                          backgroundColor: accent,
+                          padding: const EdgeInsets.symmetric(vertical: 12)),
                       onPressed: () => _showStartTableDialog(table),
                       icon: const Icon(Icons.play_arrow, color: Colors.white),
-                      label: const Text('تشغيل الترابيزة', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                      label: const Text('تشغيل الترابيزة',
+                          style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
                     ),
                   )
                 else ...[
                   Expanded(
                     child: ElevatedButton.icon(
-                      style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF263044), padding: const EdgeInsets.symmetric(vertical: 12)),
+                      style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFF263044),
+                          padding: const EdgeInsets.symmetric(vertical: 12)),
                       onPressed: () => _showAddDrinksSheet(table),
                       icon: const Icon(Icons.local_drink, color: Colors.white),
                       label: const Text('إضافة مشروب', style: TextStyle(color: Colors.white)),
@@ -536,10 +553,13 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   const SizedBox(width: 10),
                   Expanded(
                     child: ElevatedButton.icon(
-                      style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent, padding: const EdgeInsets.symmetric(vertical: 12)),
+                      style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.redAccent,
+                          padding: const EdgeInsets.symmetric(vertical: 12)),
                       onPressed: () => _showTableBillDialog(table),
                       icon: const Icon(Icons.receipt, color: Colors.white),
-                      label: const Text('تقفيل وحساب', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                      label: const Text('تقفيل وحساب',
+                          style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
                     ),
                   ),
                 ]
@@ -564,10 +584,26 @@ class _DashboardScreenState extends State<DashboardScreen> {
             content: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                RadioListTile<int?>(title: const Text('وقت مفتوح'), value: null, groupValue: mins, onChanged: (v) => setDlg(() => mins = v)),
-                RadioListTile<int?>(title: const Text('30 دقيقة'), value: 30, groupValue: mins, onChanged: (v) => setDlg(() => mins = v)),
-                RadioListTile<int?>(title: const Text('60 دقيقة (ساعة)'), value: 60, groupValue: mins, onChanged: (v) => setDlg(() => mins = v)),
-                RadioListTile<int?>(title: const Text('120 دقيقة (ساعتين)'), value: 120, groupValue: mins, onChanged: (v) => setDlg(() => mins = v)),
+                RadioListTile<int?>(
+                    title: const Text('وقت مفتوح'),
+                    value: null,
+                    groupValue: mins,
+                    onChanged: (v) => setDlg(() => mins = v)),
+                RadioListTile<int?>(
+                    title: const Text('30 دقيقة'),
+                    value: 30,
+                    groupValue: mins,
+                    onChanged: (v) => setDlg(() => mins = v)),
+                RadioListTile<int?>(
+                    title: const Text('60 دقيقة (ساعة)'),
+                    value: 60,
+                    groupValue: mins,
+                    onChanged: (v) => setDlg(() => mins = v)),
+                RadioListTile<int?>(
+                    title: const Text('120 دقيقة (ساعتين)'),
+                    value: 120,
+                    groupValue: mins,
+                    onChanged: (v) => setDlg(() => mins = v)),
               ],
             ),
             actions: [
@@ -616,12 +652,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
                           if (found.isNotEmpty) {
                             found.first.qty++;
                           } else {
-                            table.drinks.add(SaleLine(name: item.name, price: item.price, qty: 1));
+                            table.drinks
+                                .add(SaleLine(name: item.name, price: item.price, qty: 1));
                           }
                         });
                         Navigator.pop(ctx);
                         await FirestoreRestService.setDoc('menu_items', item.id, item.toMap());
-                        await FirestoreRestService.setDoc('game_tables', table.id, table.toMap());
+                        await FirestoreRestService.setDoc(
+                            'game_tables', table.id, table.toMap());
                       },
                 child: const Text('+ إضافة'),
               ),
@@ -654,7 +692,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
               Text('حساب اللعب: $tCost ج.م'),
               Text('حساب المشروبات: $dCost ج.م'),
               const Divider(),
-              Text('الإجمالي: $total ج.م', style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Color(0xFF10B981))),
+              Text('الإجمالي: $total ج.م',
+                  style: const TextStyle(
+                      fontSize: 20, fontWeight: FontWeight.bold, color: Color(0xFF10B981))),
             ],
           ),
           actions: [
@@ -727,10 +767,17 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     child: Column(
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: [
-                        Text(item.name, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16), textAlign: TextAlign.center),
+                        Text(item.name,
+                            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                            textAlign: TextAlign.center),
                         const SizedBox(height: 6),
-                        Text('${item.price.toStringAsFixed(0)} ج.م', style: const TextStyle(color: Color(0xFF10B981), fontWeight: FontWeight.bold)),
-                        Text('المخزون: ${item.stock}', style: TextStyle(fontSize: 12, color: item.stock < 5 ? Colors.redAccent : Colors.grey)),
+                        Text('${item.price.toStringAsFixed(0)} ج.م',
+                            style: const TextStyle(
+                                color: Color(0xFF10B981), fontWeight: FontWeight.bold)),
+                        Text('المخزون: ${item.stock}',
+                            style: TextStyle(
+                                fontSize: 12,
+                                color: item.stock < 5 ? Colors.redAccent : Colors.grey)),
                       ],
                     ),
                   ),
@@ -749,7 +796,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   spacing: 8,
                   children: posCart
                       .map((c) => Chip(
-                            label: Text('${c.name} × ${c.qty}'),
+                            label: Text('${c.name} ×${c.qty}'),
                             onDeleted: () {
                               setState(() {
                                 final m = menuItems.firstWhere((it) => it.name == c.name);
@@ -764,7 +811,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    Text('الإجمالي: ${cartTotal.toStringAsFixed(0)} ج.م', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                    Text('الإجمالي: ${cartTotal.toStringAsFixed(0)} ج.م',
+                        style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
                     ElevatedButton(
                       style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF10B981)),
                       onPressed: () async {
@@ -784,10 +832,12 @@ class _DashboardScreenState extends State<DashboardScreen> {
                         });
                         await FirestoreRestService.setDoc('sales', id, rec.toMap());
                         for (final item in menuItems) {
-                          await FirestoreRestService.setDoc('menu_items', item.id, item.toMap());
+                          await FirestoreRestService.setDoc(
+                              'menu_items', item.id, item.toMap());
                         }
                       },
-                      child: const Text('تأكيد البيع', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                      child: const Text('تأكيد البيع',
+                          style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
                     ),
                   ],
                 )
@@ -805,11 +855,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
       itemBuilder: (ctx, i) {
         final s = sales[i];
         final dt = DateTime.fromMillisecondsSinceEpoch(s.createdAtMs);
-        final timeStr = '${dt.day}/${dt.month} - ${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
+        final timeStr =
+            '${dt.day}/${dt.month} - ${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
         return Card(
           child: ListTile(
-            leading: Icon(s.tableHours > 0 ? Icons.sports_esports : Icons.local_cafe, color: const Color(0xFF7C3AED)),
-            title: Text('${s.source} • ${s.total.toStringAsFixed(0)} ج.م', style: const TextStyle(fontWeight: FontWeight.bold)),
+            leading: Icon(s.tableHours > 0 ? Icons.sports_esports : Icons.local_cafe,
+                color: const Color(0xFF7C3AED)),
+            title: Text('${s.source} •${s.total.toStringAsFixed(0)} ج.م',
+                style: const TextStyle(fontWeight: FontWeight.bold)),
             subtitle: Text(s.details),
             trailing: Text(timeStr, style: const TextStyle(color: Colors.grey, fontSize: 12)),
           ),
@@ -831,13 +884,16 @@ class _DashboardScreenState extends State<DashboardScreen> {
             padding: const EdgeInsets.all(16),
             child: Column(
               children: [
-                const Text('ملخص الإيرادات المسجلة', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                const Text('ملخص الإيرادات المسجلة',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
                 const Divider(height: 24),
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceAround,
                   children: [
-                    _kpiBox('الإجمالي الكلي', '${totalAll.toStringAsFixed(0)} ج.م', const Color(0xFF10B981)),
-                    _kpiBox('إيراد الألعاب', '${gamesAll.toStringAsFixed(0)} ج.م', const Color(0xFF7C3AED)),
+                    _kpiBox('الإجمالي الكلي', '${totalAll.toStringAsFixed(0)} ج.م',
+                        const Color(0xFF10B981)),
+                    _kpiBox(
+                        'إيراد الألعاب', '${gamesAll.toStringAsFixed(0)} ج.م', const Color(0xFF7C3AED)),
                     _kpiBox('إيراد الكافيه', '${drinksAll.toStringAsFixed(0)} ج.م', Colors.amber),
                   ],
                 ),
@@ -866,7 +922,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
         Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
-            const Text('إدارة الأسعار والمنيو والمخزن', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            const Text('إدارة الأسعار والمنيو والمخزن',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
             ElevatedButton.icon(
               style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF7C3AED)),
               onPressed: () => _showItemFormDialog(),
@@ -879,14 +936,16 @@ class _DashboardScreenState extends State<DashboardScreen> {
         Card(
           child: ListTile(
             title: const Text('سعر ساعة البلياردو'),
-            trailing: Text('${billiardTable.hourlyRate.toStringAsFixed(0)} ج.م', style: const TextStyle(fontWeight: FontWeight.bold)),
+            trailing: Text('${billiardTable.hourlyRate.toStringAsFixed(0)} ج.م',
+                style: const TextStyle(fontWeight: FontWeight.bold)),
             onTap: () => _showHourlyRateDialog(billiardTable),
           ),
         ),
         Card(
           child: ListTile(
             title: const Text('سعر ساعة البنج بونج'),
-            trailing: Text('${pingPongTable.hourlyRate.toStringAsFixed(0)} ج.م', style: const TextStyle(fontWeight: FontWeight.bold)),
+            trailing: Text('${pingPongTable.hourlyRate.toStringAsFixed(0)} ج.م',
+                style: const TextStyle(fontWeight: FontWeight.bold)),
             onTap: () => _showHourlyRateDialog(pingPongTable),
           ),
         ),
@@ -894,7 +953,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
         ...menuItems.map((item) => Card(
               child: ListTile(
                 title: Text(item.name, style: const TextStyle(fontWeight: FontWeight.bold)),
-                subtitle: Text('السعر: ${item.price} ج.م | المخزون: ${item.stock}'),
+                subtitle: Text('السعر: ${item.price} ج.م \vert{} المخزون: ${item.stock}'),
                 trailing: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
@@ -968,42 +1027,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
             mainAxisSize: MainAxisSize.min,
             children: [
               TextField(controller: nameCtrl, decoration: const InputDecoration(labelText: 'اسم الصنف')),
-              TextField(controller: priceCtrl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'السعر')),
-              TextField(controller: stockCtrl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'الكمية بالمخزن')),
-            ],
-          ),
-          actions: [
-            ElevatedButton(
-              onPressed: () async {
-                final price = double.tryParse(priceCtrl.text) ?? 0;
-                final stock = int.tryParse(stockCtrl.text) ?? 0;
-                if (nameCtrl.text.isNotEmpty && price > 0) {
-                  final id = existing?.id ?? DateTime.now().millisecondsSinceEpoch.toString();
-                  final item = MenuItem(
-                    id: id,
-                    name: nameCtrl.text,
-                    category: existing?.category ?? 'مشروبات',
-                    price: price,
-                    stock: stock,
-                  );
-                  setState(() {
-                    if (existing == null) {
-                      menuItems.add(item);
-                    } else {
-                      existing.name = item.name;
-                      existing.price = item.price;
-                      existing.stock = item.stock;
-                    }
-                  });
-                  Navigator.pop(ctx);
-                  await FirestoreRestService.setDoc('menu_items', id, item.toMap());
-                }
-              },
-              child: const Text('حفظ'),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
+              TextField(
+                  controller: priceCtrl,
+                  keyboardType: TextInputType.number,
+                  decoration: const InputDecoration
