@@ -1,17 +1,27 @@
 name: Build Joker Cafe
 on: [workflow_dispatch]
 
+env:
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+
 jobs:
   build-windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2
-      - run: |
-          flutter create . --platforms=windows
+        with:
+          channel: 'stable'
+      - name: Setup, Rename, Icons & Build Windows
+        shell: powershell
+        run: |
+          Copy-Item "lib/main.dart" -Destination "main_backup.dart"
+          flutter create . --platforms=windows,android --project-name=joker_cafe_pos
+          Move-Item -Path "main_backup.dart" -Destination "lib/main.dart" -Force
+          if (Test-Path "test/widget_test.dart") { Remove-Item "test/widget_test.dart" -Force }
           flutter pub get
           dart run rename_app:main all="Joker Cafe"
-          dart run flutter_launcher_icons
+          if (Test-Path "joker.png") { dart run flutter_launcher_icons }
           flutter build windows --release
       - uses: actions/upload-artifact@v4
         with:
@@ -23,11 +33,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: subosito/flutter-action@v2
-      - run: |
-          flutter create . --platforms=android
+        with:
+          channel: 'stable'
+      - name: Setup, Rename, Icons & Build APK
+        run: |
+          cp lib/main.dart main_backup.dart
+          flutter create . --platforms=android,windows --project-name=joker_cafe_pos
+          mv -f main_backup.dart lib/main.dart
+          rm -f test/widget_test.dart
           flutter pub get
           dart run rename_app:main all="Joker Cafe"
-          dart run flutter_launcher_icons
+          if [ -f "joker.png" ]; then dart run flutter_launcher_icons; fi
           flutter build apk --release
       - uses: actions/upload-artifact@v4
         with:
