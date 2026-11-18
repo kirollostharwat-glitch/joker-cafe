@@ -100,16 +100,18 @@ class GamingTable {
   final String id;
   final String name;
   final double hourlyRate;
+  final String type; // 'gaming' (بلياردو/بينج) أو 'normal' (ترابيزة قعدات عادية)
   final String status; // 'idle', 'running', 'paused'
   final DateTime? lastStartTime;
   final int accumulatedSeconds;
   final List<AttachedItem> attachedItems;
-  final String guestNotes; // خانة أسماء الأشخاص والملاحظات لكل ترابيزة
+  final String guestNotes; // أسماء الأشخاص والملاحظات للترابيزة
 
   GamingTable({
     required this.id,
     required this.name,
     required this.hourlyRate,
+    this.type = 'gaming',
     required this.status,
     this.lastStartTime,
     required this.accumulatedSeconds,
@@ -118,6 +120,7 @@ class GamingTable {
   });
 
   int get currentElapsedSeconds {
+    if (type == 'normal') return 0; // الترابيزات العادية ليس لها حساب وقت بالساعة
     if (status == 'running' && lastStartTime != null) {
       final diff = DateTime.now().difference(lastStartTime!).inSeconds;
       return accumulatedSeconds + (diff > 0 ? diff : 0);
@@ -125,7 +128,7 @@ class GamingTable {
     return accumulatedSeconds;
   }
 
-  double get currentTimeCost => (currentElapsedSeconds / 3600.0) * hourlyRate;
+  double get currentTimeCost => type == 'normal' ? 0.0 : (currentElapsedSeconds / 3600.0) * hourlyRate;
 
   double get attachedDrinksCost =>
       attachedItems.fold(0.0, (sum, item) => sum + item.total);
@@ -133,6 +136,7 @@ class GamingTable {
   double get grandTotal => currentTimeCost + attachedDrinksCost;
 
   String get formattedDuration {
+    if (type == 'normal') return 'قعدة عادية (بدون عداد وقت)';
     final totalSecs = currentElapsedSeconds;
     final hrs = (totalSecs ~/ 3600).toString().padLeft(2, '0');
     final mins = ((totalSecs % 3600) ~/ 60).toString().padLeft(2, '0');
@@ -144,6 +148,7 @@ class GamingTable {
         'id': id,
         'name': name,
         'hourlyRate': hourlyRate,
+        'type': type,
         'status': status,
         'lastStartTime': lastStartTime == null
             ? null
@@ -166,9 +171,10 @@ class GamingTable {
     }
 
     return GamingTable(
-      id: docId ?? data['id'] ?? 'billiard',
+      id: docId ?? data['id'] ?? const Uuid().v4(),
       name: data['name'] ?? '',
-      hourlyRate: (data['hourlyRate'] ?? 50.0).toDouble(),
+      hourlyRate: (data['hourlyRate'] ?? 0.0).toDouble(),
+      type: data['type'] ?? 'gaming',
       status: data['status'] ?? 'idle',
       lastStartTime: parsedStart,
       accumulatedSeconds: (data['accumulatedSeconds'] ?? 0).toInt(),
@@ -368,7 +374,7 @@ class AuditLog {
 }
 
 // =============================================================================
-// 2. CROSS-PLATFORM ALERT & SOUND NOTIFICATION SERVICE
+// 2. NOTIFICATION SERVICE
 // =============================================================================
 
 class NotificationService {
@@ -426,7 +432,7 @@ class NotificationService {
 }
 
 // =============================================================================
-// 3. HYBRID FIRESTORE + LOCAL OFFLINE SYNC SERVICE
+// 3. FIRESTORE + LOCAL SYNC SERVICE
 // =============================================================================
 
 class FirestoreService {
@@ -491,6 +497,7 @@ class FirestoreService {
           id: 'billiard',
           name: 'ترابيزة البلياردو',
           hourlyRate: 60.0,
+          type: 'gaming',
           status: 'idle',
           accumulatedSeconds: 0,
           attachedItems: [],
@@ -499,6 +506,16 @@ class FirestoreService {
           id: 'pingpong',
           name: 'ترابيزة البينج بونج',
           hourlyRate: 45.0,
+          type: 'gaming',
+          status: 'idle',
+          accumulatedSeconds: 0,
+          attachedItems: [],
+        ),
+        GamingTable(
+          id: 'table_normal_1',
+          name: 'ترابيزة قعدة عادية 1',
+          hourlyRate: 0.0,
+          type: 'normal',
           status: 'idle',
           accumulatedSeconds: 0,
           attachedItems: [],
@@ -514,36 +531,11 @@ class FirestoreService {
           .toList();
     } else {
       _localInv = [
-        InventoryItem(
-            id: '1',
-            name: 'شاي',
-            price: 15.0,
-            stock: 100,
-            lowStockThreshold: 15),
-        InventoryItem(
-            id: '2',
-            name: 'قهوة تركي',
-            price: 25.0,
-            stock: 60,
-            lowStockThreshold: 10),
-        InventoryItem(
-            id: '3',
-            name: 'نسكافيه',
-            price: 30.0,
-            stock: 45,
-            lowStockThreshold: 10),
-        InventoryItem(
-            id: '4',
-            name: 'بيبسي',
-            price: 20.0,
-            stock: 50,
-            lowStockThreshold: 12),
-        InventoryItem(
-            id: '5',
-            name: 'مية معدنية',
-            price: 10.0,
-            stock: 80,
-            lowStockThreshold: 20),
+        InventoryItem(id: '1', name: 'شاي', price: 15.0, stock: 100, lowStockThreshold: 15),
+        InventoryItem(id: '2', name: 'قهوة تركي', price: 25.0, stock: 60, lowStockThreshold: 10),
+        InventoryItem(id: '3', name: 'نسكافيه', price: 30.0, stock: 45, lowStockThreshold: 10),
+        InventoryItem(id: '4', name: 'بيبسي', price: 20.0, stock: 50, lowStockThreshold: 12),
+        InventoryItem(id: '5', name: 'مية معدنية', price: 10.0, stock: 80, lowStockThreshold: 20),
       ];
     }
 
@@ -577,16 +569,14 @@ class FirestoreService {
   void _saveAndEmitLocal() {
     _prefs.setString(
         'local_tables',
-        jsonEncode(
-            _localTables.map((e) => e.toMap(forLocal: true)).toList()));
+        jsonEncode(_localTables.map((e) => e.toMap(forLocal: true)).toList()));
     _prefs.setString(
         'local_inv', jsonEncode(_localInv.map((e) => e.toMap()).toList()));
     _prefs.setString('local_sales',
         jsonEncode(_localSales.map((e) => e.toMap(forLocal: true)).toList()));
     _prefs.setString(
         'local_closed_days',
-        jsonEncode(
-            _localClosedDays.map((e) => e.toMap(forLocal: true)).toList()));
+        jsonEncode(_localClosedDays.map((e) => e.toMap(forLocal: true)).toList()));
     _prefs.setString('local_logs',
         jsonEncode(_localLogs.map((e) => e.toMap(forLocal: true)).toList()));
 
@@ -605,6 +595,7 @@ class FirestoreService {
               id: 'billiard',
               name: 'ترابيزة البلياردو',
               hourlyRate: 60.0,
+              type: 'gaming',
               status: 'idle',
               accumulatedSeconds: 0,
               attachedItems: [],
@@ -614,6 +605,17 @@ class FirestoreService {
               id: 'pingpong',
               name: 'ترابيزة البينج بونج',
               hourlyRate: 45.0,
+              type: 'gaming',
+              status: 'idle',
+              accumulatedSeconds: 0,
+              attachedItems: [],
+            ).toMap());
+
+        await _db!.collection('tables').doc('table_normal_1').set(GamingTable(
+              id: 'table_normal_1',
+              name: 'ترابيزة قعدة عادية 1',
+              hourlyRate: 0.0,
+              type: 'normal',
               status: 'idle',
               accumulatedSeconds: 0,
               attachedItems: [],
@@ -733,7 +735,35 @@ class FirestoreService {
     return _logsCtrl.stream;
   }
 
+  // إضافة ترابيزة جديدة (سواء عادية أو ألعاب)
+  Future<void> addNewTable({required String name, required String type, required double hourlyRate}) async {
+    final newId = const Uuid().v4();
+    final table = GamingTable(
+      id: newId,
+      name: name,
+      hourlyRate: hourlyRate,
+      type: type,
+      status: 'idle',
+      accumulatedSeconds: 0,
+      attachedItems: [],
+    );
+
+    if (useCloud) {
+      await _db!.collection('tables').doc(newId).set(table.toMap());
+    } else {
+      _localTables.add(table);
+      _saveAndEmitLocal();
+    }
+    await _recordAudit(
+      title: 'إضافة ترابيزة جديدة',
+      message: 'تم إضافة ترابيزة جديدة باسم [$name]',
+      beforeVal: 'غير موجودة',
+      afterVal: 'متاحة',
+    );
+  }
+
   Future<void> startTableTimer(GamingTable table) async {
+    if (table.type == 'normal') return;
     if (useCloud) {
       await _db!.collection('tables').doc(table.id).update({
         'status': 'running',
@@ -746,6 +776,7 @@ class FirestoreService {
           id: table.id,
           name: table.name,
           hourlyRate: table.hourlyRate,
+          type: table.type,
           status: 'running',
           lastStartTime: DateTime.now(),
           accumulatedSeconds: table.accumulatedSeconds,
@@ -756,14 +787,15 @@ class FirestoreService {
       }
     }
     await _recordAudit(
-      title: 'تنبيه ترابيزة: ${table.name}',
-      message: 'تم تشغيل الوقت على ${table.name}',
+      title: 'تشغيل وقت ترابيزة: ${table.name}',
+      message: 'تم بدء الوقت على ${table.name}',
       beforeVal: 'متوقفة',
       afterVal: 'شغالة الآن',
     );
   }
 
   Future<void> pauseTableTimer(GamingTable table) async {
+    if (table.type == 'normal') return;
     final totalElapsed = table.currentElapsedSeconds;
     if (useCloud) {
       await _db!.collection('tables').doc(table.id).update({
@@ -778,6 +810,7 @@ class FirestoreService {
           id: table.id,
           name: table.name,
           hourlyRate: table.hourlyRate,
+          type: table.type,
           status: 'paused',
           lastStartTime: null,
           accumulatedSeconds: totalElapsed,
@@ -787,43 +820,6 @@ class FirestoreService {
         _saveAndEmitLocal();
       }
     }
-    await _recordAudit(
-      title: 'تنبيه ترابيزة: ${table.name}',
-      message: 'تم إيقاف مؤقت لـ ${table.name}',
-      beforeVal: 'شغالة',
-      afterVal: 'إيقاف مؤقت (${table.formattedDuration})',
-    );
-  }
-
-  Future<void> updateTableHourlyRate(GamingTable table, double newRate) async {
-    final oldRate = table.hourlyRate;
-    if (useCloud) {
-      await _db!.collection('tables').doc(table.id).update({
-        'hourlyRate': newRate,
-      });
-    } else {
-      final idx = _localTables.indexWhere((t) => t.id == table.id);
-      if (idx >= 0) {
-        _localTables[idx] = GamingTable(
-          id: table.id,
-          name: table.name,
-          hourlyRate: newRate,
-          status: table.status,
-          lastStartTime: table.lastStartTime,
-          accumulatedSeconds: table.accumulatedSeconds,
-          attachedItems: table.attachedItems,
-          guestNotes: table.guestNotes,
-        );
-        _saveAndEmitLocal();
-      }
-    }
-    await _recordAudit(
-      title: 'تنبيه تعديل سعر الساعة',
-      message:
-          'تم تغيير سعر ساعة ${table.name} من ${oldRate.toStringAsFixed(0)} إلى ${newRate.toStringAsFixed(0)} ج.م',
-      beforeVal: '${oldRate.toStringAsFixed(0)} ج.م',
-      afterVal: '${newRate.toStringAsFixed(0)} ج.م',
-    );
   }
 
   Future<void> updateTableGuestNotes(GamingTable table, String notes) async {
@@ -838,6 +834,7 @@ class FirestoreService {
           id: table.id,
           name: table.name,
           hourlyRate: table.hourlyRate,
+          type: table.type,
           status: table.status,
           lastStartTime: table.lastStartTime,
           accumulatedSeconds: table.accumulatedSeconds,
@@ -849,6 +846,7 @@ class FirestoreService {
     }
   }
 
+  // إضافة مشاريب للترابيزة وتفضل هولد مع اسم الشخص
   Future<void> attachDrinksToTable(
       GamingTable table, Map<InventoryItem, int> selectedDrinks) async {
     final updatedList = List<AttachedItem>.from(table.attachedItems);
@@ -859,10 +857,7 @@ class FirestoreService {
       final newStock = (item.stock - qty).clamp(0, 999999);
 
       if (useCloud) {
-        await _db!
-            .collection('inventory')
-            .doc(item.id)
-            .update({'stock': newStock});
+        await _db!.collection('inventory').doc(item.id).update({'stock': newStock});
       } else {
         final iIdx = _localInv.indexWhere((i) => i.id == item.id);
         if (iIdx >= 0) {
@@ -876,8 +871,7 @@ class FirestoreService {
         }
       }
 
-      final existingIndex =
-          updatedList.indexWhere((element) => element.itemId == item.id);
+      final existingIndex = updatedList.indexWhere((element) => element.itemId == item.id);
       if (existingIndex >= 0) {
         final existing = updatedList[existingIndex];
         updatedList[existingIndex] = AttachedItem(
@@ -907,6 +901,7 @@ class FirestoreService {
           id: table.id,
           name: table.name,
           hourlyRate: table.hourlyRate,
+          type: table.type,
           status: table.status,
           lastStartTime: table.lastStartTime,
           accumulatedSeconds: table.accumulatedSeconds,
@@ -926,7 +921,7 @@ class FirestoreService {
 
     final sale = SaleRecord(
       id: const Uuid().v4(),
-      type: table.id == 'billiard' ? 'billiard_checkout' : 'pingpong_checkout',
+      type: table.type == 'normal' ? 'normal_table_checkout' : 'gaming_checkout',
       timeRevenue: timeCost,
       drinksRevenue: drinksCost,
       totalRevenue: total,
@@ -953,6 +948,7 @@ class FirestoreService {
           id: table.id,
           name: table.name,
           hourlyRate: table.hourlyRate,
+          type: table.type,
           status: 'idle',
           lastStartTime: null,
           accumulatedSeconds: 0,
@@ -965,10 +961,9 @@ class FirestoreService {
 
     await _recordAudit(
       title: 'حساب ترابيزة: ${table.name}',
-      message:
-          'تم إنهاء وحساب ${table.name} بإجمالي ${total.toStringAsFixed(1)} ج.م',
-      beforeVal: table.formattedDuration,
-      afterVal: 'تم التصفير (الحساب: ${total.toStringAsFixed(1)} ج.م)',
+      message: 'تم إنهاء وحساب ${table.name} بإجمالي ${total.toStringAsFixed(1)} ج.م',
+      beforeVal: 'مفتوحة (Hold)',
+      afterVal: 'تم التحصيل والتصفير',
     );
 
     return sale;
@@ -992,10 +987,7 @@ class FirestoreService {
 
       final newStock = (item.stock - qty).clamp(0, 999999);
       if (useCloud) {
-        await _db!
-            .collection('inventory')
-            .doc(item.id)
-            .update({'stock': newStock});
+        await _db!.collection('inventory').doc(item.id).update({'stock': newStock});
       } else {
         final idx = _localInv.indexWhere((i) => i.id == item.id);
         if (idx >= 0) {
@@ -1032,16 +1024,13 @@ class FirestoreService {
 
   Future<void> closeCurrentDayAndReset({
     required double drinksRev,
-    required double billiardRev,
-    required double pingPongRev,
+    required double tableRev,
     required double grandTotal,
   }) async {
     final now = DateTime.now();
-    final dateStr =
-        '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
+    final dateStr = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
 
-    double extraBilliard = 0;
-    double extraPingPong = 0;
+    double extraTableRev = 0;
     double extraDrinks = 0;
 
     if (useCloud) {
@@ -1049,11 +1038,7 @@ class FirestoreService {
       for (final doc in tablesSnap.docs) {
         final t = GamingTable.fromDoc(doc);
         if (t.currentElapsedSeconds > 0 || t.attachedItems.isNotEmpty) {
-          if (t.id == 'billiard') {
-            extraBilliard += t.currentTimeCost;
-          } else {
-            extraPingPong += t.currentTimeCost;
-          }
+          extraTableRev += t.currentTimeCost;
           extraDrinks += t.attachedDrinksCost;
 
           await doc.reference.update({
@@ -1069,17 +1054,14 @@ class FirestoreService {
       for (int i = 0; i < _localTables.length; i++) {
         final t = _localTables[i];
         if (t.currentElapsedSeconds > 0 || t.attachedItems.isNotEmpty) {
-          if (t.id == 'billiard') {
-            extraBilliard += t.currentTimeCost;
-          } else {
-            extraPingPong += t.currentTimeCost;
-          }
+          extraTableRev += t.currentTimeCost;
           extraDrinks += t.attachedDrinksCost;
 
           _localTables[i] = GamingTable(
             id: t.id,
             name: t.name,
             hourlyRate: t.hourlyRate,
+            type: t.type,
             status: 'idle',
             lastStartTime: null,
             accumulatedSeconds: 0,
@@ -1091,16 +1073,15 @@ class FirestoreService {
     }
 
     final finalDrinks = drinksRev + extraDrinks;
-    final finalBilliard = billiardRev + extraBilliard;
-    final finalPingPong = pingPongRev + extraPingPong;
-    final finalGrandTotal = finalDrinks + finalBilliard + finalPingPong;
+    final finalTables = tableRev + extraTableRev;
+    final finalGrandTotal = finalDrinks + finalTables;
 
     final summary = ClosedDaySummary(
       id: const Uuid().v4(),
       dateLabel: dateStr,
       drinksRevenue: finalDrinks,
-      billiardRevenue: finalBilliard,
-      pingPongRevenue: finalPingPong,
+      billiardRevenue: finalTables,
+      pingPongRevenue: 0.0,
       grandTotal: finalGrandTotal,
       closedAt: now,
     );
@@ -1111,11 +1092,7 @@ class FirestoreService {
       }
       final allSalesSnap = await _db!.collection('sales').get();
       for (final doc in allSalesSnap.docs) {
-        try {
-          await doc.reference.delete();
-        } catch (_) {
-          await doc.reference.update({'isClosed': true});
-        }
+        await doc.reference.delete();
       }
     } else {
       if (finalGrandTotal > 0) {
@@ -1124,14 +1101,6 @@ class FirestoreService {
       _localSales.clear();
       _saveAndEmitLocal();
     }
-
-    await _recordAudit(
-      title: 'تنبيه تقفيل اليوم - Joker Cafe',
-      message:
-          'تم تقفيل حسابات يوم $dateStr بإجمالي ${finalGrandTotal.toStringAsFixed(1)} ج.م وتصفير الشيفت',
-      beforeVal: '${finalGrandTotal.toStringAsFixed(1)} ج.م',
-      afterVal: '0.0 ج.م (تم التصفير)',
-    );
   }
 
   Future<void> addNewInventoryItem({
@@ -1157,21 +1126,11 @@ class FirestoreService {
       ));
       _saveAndEmitLocal();
     }
-    await _recordAudit(
-      title: 'إضافة صنف جديد للمخزن',
-      message: 'تم إضافة [$name] بسعر $price ج.م وكمية $stock',
-      beforeVal: 'غير موجود',
-      afterVal: '$price ج.م ($stock قطعة)',
-    );
   }
 
   Future<void> updateItemPrice(InventoryItem item, double newPrice) async {
-    final oldPrice = item.price;
     if (useCloud) {
-      await _db!
-          .collection('inventory')
-          .doc(item.id)
-          .update({'price': newPrice});
+      await _db!.collection('inventory').doc(item.id).update({'price': newPrice});
     } else {
       final idx = _localInv.indexWhere((i) => i.id == item.id);
       if (idx >= 0) {
@@ -1185,22 +1144,11 @@ class FirestoreService {
         _saveAndEmitLocal();
       }
     }
-    await _recordAudit(
-      title: 'تنبيه تعديل سعر',
-      message:
-          'تم تغيير سعر [${item.name}] من ${oldPrice.toStringAsFixed(1)} إلى ${newPrice.toStringAsFixed(1)} ج.م',
-      beforeVal: '${oldPrice.toStringAsFixed(1)} ج.م',
-      afterVal: '${newPrice.toStringAsFixed(1)} ج.م',
-    );
   }
 
   Future<void> updateItemStock(InventoryItem item, int newStock) async {
-    final oldStock = item.stock;
     if (useCloud) {
-      await _db!
-          .collection('inventory')
-          .doc(item.id)
-          .update({'stock': newStock});
+      await _db!.collection('inventory').doc(item.id).update({'stock': newStock});
     } else {
       final idx = _localInv.indexWhere((i) => i.id == item.id);
       if (idx >= 0) {
@@ -1214,12 +1162,6 @@ class FirestoreService {
         _saveAndEmitLocal();
       }
     }
-    await _recordAudit(
-      title: 'تنبيه مخزن',
-      message: 'تم تعديل كمية [${item.name}] من $oldStock إلى $newStock',
-      beforeVal: '$oldStock',
-      afterVal: '$newStock',
-    );
   }
 
   Future<void> deleteInventoryItem(InventoryItem item) async {
@@ -1229,163 +1171,15 @@ class FirestoreService {
       _localInv.removeWhere((i) => i.id == item.id);
       _saveAndEmitLocal();
     }
-    await _recordAudit(
-      title: 'حذف صنف من المخزن',
-      message: 'تم حذف الصنف [${item.name}] نهائياً من المخزن',
-      beforeVal: '${item.stock} بالمخزن',
-      afterVal: 'محذوف',
-    );
   }
 }
 
 // =============================================================================
-// 4. EXPORT SERVICE
-// =============================================================================
-
-class ExportService {
-  static Future<void> exportDailyPdfReport({
-    required List<SaleRecord> sales,
-    required List<AuditLog> logs,
-    required double drinksRev,
-    required double billiardRev,
-    required double pingPongRev,
-    required double grandTotal,
-    required Map<String, int> itemBreakdown,
-  }) async {
-    final pdf = pw.Document();
-    final arabicFont = await PdfGoogleFonts.cairoRegular();
-    final arabicBold = await PdfGoogleFonts.cairoBold();
-    final dateStr = intl.DateFormat('yyyy-MM-dd HH:mm').format(DateTime.now());
-
-    pdf.addPage(
-      pw.MultiPage(
-        pageFormat: PdfPageFormat.a4,
-        textDirection: pw.TextDirection.rtl,
-        theme: pw.ThemeData.withFont(base: arabicFont, bold: arabicBold),
-        build: (context) => [
-          pw.Header(
-            level: 0,
-            child: pw.Row(
-              mainAxisAlignment: pw.MainAxisAlignment.spaceBetween,
-              children: [
-                pw.Text('Joker Cafe - تقرير تقفيل الشيفت وحسابات اليوم',
-                    style: pw.TextStyle(font: arabicBold, fontSize: 18)),
-                pw.Text('التاريخ: $dateStr',
-                    style: const pw.TextStyle(fontSize: 12)),
-              ],
-            ),
-          ),
-          pw.SizedBox(height: 12),
-          pw.Container(
-            padding: const pw.EdgeInsets.all(12),
-            decoration: pw.BoxDecoration(
-              border: pw.Border.all(color: PdfColors.grey700),
-              borderRadius: const pw.BorderRadius.all(pw.Radius.circular(8)),
-            ),
-            child: pw.Column(
-              crossAxisAlignment: pw.CrossAxisAlignment.start,
-              children: [
-                pw.Text('إيراد المشاريب: ${drinksRev.toStringAsFixed(2)} ج.م'),
-                pw.Text(
-                    'إيراد البلياردو: ${billiardRev.toStringAsFixed(2)} ج.م'),
-                pw.Text(
-                    'إيراد البينج بونج: ${pingPongRev.toStringAsFixed(2)} ج.م'),
-                pw.Divider(),
-                pw.Text(
-                  'الإجمالي الكلي: ${grandTotal.toStringAsFixed(2)} ج.م',
-                  style: pw.TextStyle(font: arabicBold, fontSize: 16),
-                ),
-              ],
-            ),
-          ),
-          pw.SizedBox(height: 18),
-          pw.Text('تفاصيل المشاريب المباعة اليوم:',
-              style: pw.TextStyle(font: arabicBold, fontSize: 14)),
-          pw.SizedBox(height: 8),
-          pw.TableHelper.fromTextArray(
-            headers: ['الكمية المباعة', 'اسم الصنف'],
-            data: itemBreakdown.entries
-                .map((e) => [e.value.toString(), e.key])
-                .toList(),
-          ),
-        ],
-      ),
-    );
-
-    await Printing.layoutPdf(
-      onLayout: (format) async => pdf.save(),
-      name: 'JokerCafe_Report_$dateStr.pdf',
-    );
-  }
-
-  static Future<String> exportExcelReport({
-    required List<SaleRecord> sales,
-    required List<AuditLog> logs,
-    required double drinksRev,
-    required double billiardRev,
-    required double pingPongRev,
-    required double grandTotal,
-    required Map<String, int> itemBreakdown,
-  }) async {
-    final excel = Excel.createExcel();
-    final summarySheet = excel['ملخص اليوم'];
-    excel.setDefaultSheet('ملخص اليوم');
-
-    summarySheet.appendRow([
-      TextCellValue('Joker Cafe - البند'),
-      TextCellValue('القيمة (ج.م)'),
-    ]);
-    summarySheet.appendRow([
-      TextCellValue('إيراد المشاريب'),
-      DoubleCellValue(drinksRev),
-    ]);
-    summarySheet.appendRow([
-      TextCellValue('إيراد البلياردو'),
-      DoubleCellValue(billiardRev),
-    ]);
-    summarySheet.appendRow([
-      TextCellValue('إيراد البينج بونج'),
-      DoubleCellValue(pingPongRev),
-    ]);
-    summarySheet.appendRow([
-      TextCellValue('الإجمالي الكلي'),
-      DoubleCellValue(grandTotal),
-    ]);
-
-    final fileBytes = excel.save();
-    if (fileBytes == null) throw Exception('فشل إنشاء ملف الإكسيل');
-
-    final timestamp = intl.DateFormat('yyyyMMdd_HHmm').format(DateTime.now());
-    final fileName = 'JokerCafe_Report_$timestamp.xlsx';
-
-    if (Platform.isWindows) {
-      final downloadsDir = await getDownloadsDirectory() ??
-          await getApplicationDocumentsDirectory();
-      final filePath = '${downloadsDir.path}\\$fileName';
-      final file = File(filePath);
-      await file.writeAsBytes(fileBytes);
-      return 'تم حفظ شيت الإكسيل في التنزيلات:\n$filePath';
-    } else {
-      final tempDir = await getTemporaryDirectory();
-      final filePath = '${tempDir.path}/$fileName';
-      final file = File(filePath);
-      await file.writeAsBytes(fileBytes);
-      await Share.shareXFiles(
-        [XFile(filePath)],
-        text: 'Joker Cafe - تقرير تقفيل الشيفت وحسابات اليوم',
-      );
-      return 'تم تجهيز شيت الإكسيل للمشاركة';
-    }
-  }
-}
-
-// =============================================================================
-// 5. MAIN ENTRY POINT & UI
+// 4. MAIN ENTRY POINT & UI
 // =============================================================================
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-
   bool firebaseReady = false;
   try {
     await Firebase.initializeApp();
@@ -1431,10 +1225,7 @@ class CafeAdminApp extends StatelessWidget {
         textTheme: cairoTheme,
       ),
       builder: (context, child) {
-        return Directionality(
-          textDirection: TextDirection.rtl,
-          child: child!,
-        );
+        return Directionality(textDirection: TextDirection.rtl, child: child!);
       },
       home: AdminDashboardShell(db: firestoreService),
     );
@@ -1497,8 +1288,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                     final sales = salesSnap.data ?? [];
                     final logs = logsSnap.data ?? [];
 
-                    final todayTotal = sales.fold<double>(
-                        0.0, (sum, s) => sum + s.totalRevenue);
+                    final todayTotal = sales.fold<double>(0.0, (sum, s) => sum + s.totalRevenue);
 
                     return LayoutBuilder(
                       builder: (context, constraints) {
@@ -1507,114 +1297,42 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                         return Scaffold(
                           appBar: AppBar(
                             backgroundColor: const Color(0xFF181E2C),
-                            elevation: 2,
                             title: Row(
                               children: [
-                                Container(
-                                  padding: const EdgeInsets.all(6),
-                                  decoration: BoxDecoration(
-                                    color: Colors.purple.shade900,
-                                    borderRadius: BorderRadius.circular(8),
-                                    border: Border.all(
-                                        color: const Color(0xFF00C896)),
-                                  ),
-                                  child: const Icon(
-                                    Icons.theater_comedy,
-                                    color: Color(0xFF00C896),
-                                    size: 24,
-                                  ),
-                                ),
+                                const Icon(Icons.theater_comedy, color: Color(0xFF00C896)),
                                 const SizedBox(width: 10),
                                 const Expanded(
-                                  child: Text(
-                                    'Joker Cafe - لوحة تحكم الأدمن',
-                                    style:
-                                        TextStyle(fontWeight: FontWeight.bold),
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
+                                  child: Text('Joker Cafe - لوحة التحكم', style: TextStyle(fontWeight: FontWeight.bold)),
                                 ),
                                 Container(
-                                  padding: const EdgeInsets.symmetric(
-                                      horizontal: 12, vertical: 6),
+                                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
                                   decoration: BoxDecoration(
                                     color: Colors.teal.withValues(alpha: 0.2),
                                     borderRadius: BorderRadius.circular(12),
-                                    border: Border.all(
-                                        color: const Color(0xFF00C896)),
+                                    border: Border.all(color: const Color(0xFF00C896)),
                                   ),
                                   child: Text(
                                     'إجمالي الشيفت: ${todayTotal.toStringAsFixed(1)} ج.م',
-                                    style: const TextStyle(
-                                      fontSize: 13,
-                                      fontWeight: FontWeight.bold,
-                                      color: Color(0xFF00C896),
-                                    ),
+                                    style: const TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF00C896)),
                                   ),
                                 ),
                               ],
                             ),
-                            bottom: PreferredSize(
-                              preferredSize: const Size.fromHeight(30),
-                              child: Container(
-                                width: double.infinity,
-                                color: _isOnline
-                                    ? Colors.green.shade800
-                                    : Colors.orange.shade900,
-                                padding: const EdgeInsets.symmetric(
-                                    vertical: 4, horizontal: 16),
-                                child: Row(
-                                  mainAxisAlignment: MainAxisAlignment.center,
-                                  children: [
-                                    Icon(
-                                      _isOnline ? Icons.wifi : Icons.wifi_off,
-                                      size: 16,
-                                      color: Colors.white,
-                                    ),
-                                    const SizedBox(width: 8),
-                                    Text(
-                                      _isOnline
-                                          ? 'متصل بالنت - متزامن لحظياً بين اللاب والموبايل'
-                                          : 'أوفلاين - شغال على التخزين المحلي',
-                                      style: const TextStyle(
-                                          fontSize: 12, color: Colors.white),
-                                    ),
-                                  ],
-                                ),
-                              ),
-                            ),
                           ),
                           body: isWideDesktop
-                              ? _buildWindowsDesktopView(
-                                  tables, inventory, sales, logs)
-                              : _buildAndroidMobileView(
-                                  tables, inventory, sales, logs),
+                              ? _buildWindowsDesktopView(tables, inventory, sales, logs)
+                              : _buildAndroidMobileView(tables, inventory, sales, logs),
                           bottomNavigationBar: isWideDesktop
                               ? null
                               : NavigationBar(
                                   selectedIndex: _selectedIndex,
-                                  onDestinationSelected: (idx) =>
-                                      setState(() => _selectedIndex = idx),
+                                  onDestinationSelected: (idx) => setState(() => _selectedIndex = idx),
                                   destinations: const [
-                                    NavigationDestination(
-                                      icon: Icon(Icons.sports_esports),
-                                      label: 'الترابيزات',
-                                    ),
-                                    NavigationDestination(
-                                      icon: Icon(Icons.point_of_sale),
-                                      label: 'الكاشير',
-                                    ),
-                                    NavigationDestination(
-                                      icon: Icon(Icons.inventory_2),
-                                      label: 'المخزن',
-                                    ),
-                                    NavigationDestination(
-                                      icon: Icon(Icons.bar_chart),
-                                      label: 'تقفيل اليوم',
-                                    ),
-                                    NavigationDestination(
-                                      icon: Icon(Icons.notifications_active),
-                                      label: 'التعديلات',
-                                    ),
+                                    NavigationDestination(icon: Icon(Icons.table_bar), label: 'الترابيزات'),
+                                    NavigationDestination(icon: Icon(Icons.point_of_sale), label: 'الكاشير'),
+                                    NavigationDestination(icon: Icon(Icons.inventory_2), label: 'المخزن'),
+                                    NavigationDestination(icon: Icon(Icons.bar_chart), label: 'تقفيل اليوم'),
+                                    NavigationDestination(icon: Icon(Icons.history), label: 'التعديلات'),
                                   ],
                                 ),
                         );
@@ -1637,7 +1355,6 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
     List<AuditLog> logs,
   ) {
     final desktopIndex = _selectedIndex > 3 ? 0 : _selectedIndex;
-
     return Row(
       children: [
         NavigationRail(
@@ -1646,22 +1363,10 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
           extended: true,
           backgroundColor: const Color(0xFF181E2C),
           destinations: const [
-            NavigationRailDestination(
-              icon: Icon(Icons.dashboard_customize),
-              label: Text('الترابيزات والكاشير'),
-            ),
-            NavigationRailDestination(
-              icon: Icon(Icons.inventory_2),
-              label: Text('إدارة المخزن والأسعار'),
-            ),
-            NavigationRailDestination(
-              icon: Icon(Icons.assessment),
-              label: Text('التقارير وتقفيل اليوم'),
-            ),
-            NavigationRailDestination(
-              icon: Icon(Icons.history),
-              label: Text('سجل التعديلات والإشعارات'),
-            ),
+            NavigationRailDestination(icon: Icon(Icons.dashboard_customize), label: Text('الترابيزات والكاشير')),
+            NavigationRailDestination(icon: Icon(Icons.inventory_2), label: Text('إدارة المخزن')),
+            NavigationRailDestination(icon: Icon(Icons.assessment), label: Text('التقارير وتقفيل اليوم')),
+            NavigationRailDestination(icon: Icon(Icons.history), label: Text('سجل العمليات')),
           ],
         ),
         const VerticalDivider(width: 1),
@@ -1673,19 +1378,13 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                   return Row(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Expanded(
-                        flex: 5,
-                        child: _buildTablesSection(tables, inventory),
-                      ),
+                      Expanded(flex: 5, child: _buildTablesSection(tables, inventory)),
                       const VerticalDivider(width: 1),
-                      Expanded(
-                        flex: 5,
-                        child: _buildPosSection(inventory, tables),
-                      ),
+                      Expanded(flex: 5, child: _buildPosSection(inventory, tables)),
                     ],
                   );
                 case 1:
-                  return _buildInventorySection(inventory, tables);
+                  return _buildInventorySection(inventory);
                 case 2:
                   return _buildReportsSection(sales, logs);
                 case 3:
@@ -1712,7 +1411,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
       case 1:
         return _buildPosSection(inventory, tables);
       case 2:
-        return _buildInventorySection(inventory, tables);
+        return _buildInventorySection(inventory);
       case 3:
         return _buildReportsSection(sales, logs);
       case 4:
@@ -1722,14 +1421,21 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
     }
   }
 
-  Widget _buildTablesSection(
-      List<GamingTable> tables, List<InventoryItem> inventory) {
+  Widget _buildTablesSection(List<GamingTable> tables, List<InventoryItem> inventory) {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
-        const Text(
-          'إدارة الترابيزات - بلياردو وبينج بونج',
-          style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            const Text('إدارة الترابيزات (ألعاب وقعدات عادية)', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            ElevatedButton.icon(
+              style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF00C896), foregroundColor: Colors.black),
+              onPressed: _showAddTableDialog,
+              icon: const Icon(Icons.add),
+              label: const Text('إضافة ترابيزة'),
+            ),
+          ],
         ),
         const SizedBox(height: 12),
         ...tables.map((table) => _buildTableCard(table, inventory)),
@@ -1738,11 +1444,9 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
   }
 
   Widget _buildTableCard(GamingTable table, List<InventoryItem> inventory) {
+    final isNormal = table.type == 'normal';
     final isRunning = table.status == 'running';
-    final isPaused = table.status == 'paused';
-    final statusColor = isRunning
-        ? const Color(0xFF00C896)
-        : (isPaused ? Colors.orangeAccent : Colors.grey);
+    final statusColor = isNormal ? Colors.purpleAccent : (isRunning ? const Color(0xFF00C896) : Colors.grey);
 
     return Card(
       margin: const EdgeInsets.only(bottom: 16),
@@ -1760,130 +1464,82 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
               children: [
                 Row(
                   children: [
-                    Icon(
-                      table.id == 'billiard'
-                          ? Icons.lens_blur
-                          : Icons.sports_tennis,
-                      color: statusColor,
-                      size: 28,
-                    ),
+                    Icon(isNormal ? Icons.table_restaurant : Icons.sports_esports, color: statusColor, size: 26),
                     const SizedBox(width: 10),
-                    Text(
-                      table.name,
-                      style: const TextStyle(
-                          fontSize: 20, fontWeight: FontWeight.bold),
-                    ),
+                    Text(table.name, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
                   ],
                 ),
-                ActionChip(
-                  avatar: const Icon(Icons.edit, size: 16),
-                  label: Text(
-                      'سعر الساعة: ${table.hourlyRate.toStringAsFixed(0)} ج.م'),
-                  onPressed: () => _showEditHourlyRateDialog(table),
+                Chip(
+                  label: Text(isNormal ? 'ترابيزة عادية (قعدة)' : 'ساعة: ${table.hourlyRate.toStringAsFixed(0)} ج.م'),
+                  backgroundColor: statusColor.withValues(alpha: 0.2),
                 ),
               ],
             ),
-            const Divider(height: 24),
+            const Divider(height: 20),
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceAround,
               children: [
-                _metricColumn(
-                    'الوقت الفعلي', table.formattedDuration, statusColor),
-                _metricColumn(
-                    'حساب الوقت',
-                    '${table.currentTimeCost.toStringAsFixed(1)} ج.م',
-                    Colors.white),
-                _metricColumn(
-                    'حساب المشاريب',
-                    '${table.attachedDrinksCost.toStringAsFixed(1)} ج.م',
-                    Colors.amber),
-                _metricColumn(
-                    'إجمالي الترابيزة',
-                    '${table.grandTotal.toStringAsFixed(1)} ج.م',
-                    const Color(0xFF00C896)),
+                if (!isNormal) _metricColumn('الوقت', table.formattedDuration, statusColor),
+                if (!isNormal) _metricColumn('حساب الوقت', '${table.currentTimeCost.toStringAsFixed(1)} ج.م', Colors.white),
+                _metricColumn('حساب المشاريب (Hold)', '${table.attachedDrinksCost.toStringAsFixed(1)} ج.م', Colors.amber),
+                _metricColumn('الإجمالي', '${table.grandTotal.toStringAsFixed(1)} ج.م', const Color(0xFF00C896)),
               ],
             ),
             const SizedBox(height: 12),
             TextField(
               controller: TextEditingController(text: table.guestNotes)
-                ..selection = TextSelection.fromPosition(
-                    TextPosition(offset: table.guestNotes.length)),
-              onChanged: (val) {
-                widget.db.updateTableGuestNotes(table, val);
-              },
+                ..selection = TextSelection.fromPosition(TextPosition(offset: table.guestNotes.length)),
+              onChanged: (val) => widget.db.updateTableGuestNotes(table, val),
               decoration: InputDecoration(
-                labelText: 'أسماء الأشخاص / ملاحظات الطرابيزة',
-                hintText: 'اكتب اسم كل شخص هنا (متزامن لحظياً)...',
-                prefixIcon: const Icon(Icons.note_alt, color: Color(0xFF00C896)),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(10),
-                ),
+                labelText: 'أسماء الأشخاص / الملاحظات (متزامن لحظياً)',
+                hintText: 'اكتب أسماء الأشخاص على الترابيزة...',
+                prefixIcon: const Icon(Icons.person, color: Color(0xFF00C896)),
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
                 filled: true,
                 fillColor: Colors.black26,
               ),
               maxLines: 2,
             ),
             if (table.attachedItems.isNotEmpty) ...[
-              const SizedBox(height: 12),
-              Container(
-                padding: const EdgeInsets.all(10),
-                decoration: BoxDecoration(
-                  color: Colors.black26,
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: Wrap(
-                  spacing: 8,
-                  children: table.attachedItems
-                      .map((item) => Chip(
-                            label: Text(
-                                '${item.name} × ${item.qty} (${item.total.toStringAsFixed(0)} ج.م)'),
-                          ))
-                      .toList(),
-                ),
+              const SizedBox(height: 10),
+              Wrap(
+                spacing: 8,
+                children: table.attachedItems.map((item) => Chip(
+                  label: Text('${item.name} × ${item.qty} (${item.total.toStringAsFixed(0)} ج.م)'),
+                  backgroundColor: Colors.amber.shade900.withValues(alpha: 0.4),
+                )).toList(),
               ),
             ],
-            const SizedBox(height: 16),
+            const SizedBox(height: 14),
             Wrap(
-              spacing: 10,
-              runSpacing: 10,
+              spacing: 8,
+              runSpacing: 8,
               children: [
-                ElevatedButton.icon(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF00C896),
-                    foregroundColor: Colors.black,
+                if (!isNormal) ...[
+                  ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF00C896), foregroundColor: Colors.black),
+                    onPressed: isRunning ? null : () => widget.db.startTableTimer(table),
+                    icon: const Icon(Icons.play_arrow),
+                    label: const Text('تشغيل'),
                   ),
-                  onPressed:
-                      isRunning ? null : () => widget.db.startTableTimer(table),
-                  icon: const Icon(Icons.play_arrow),
-                  label: const Text('ابدأ الوقت',
-                      style: TextStyle(fontWeight: FontWeight.bold)),
-                ),
-                ElevatedButton.icon(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.amber.shade700,
-                    foregroundColor: Colors.black,
+                  ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(backgroundColor: Colors.amber.shade700, foregroundColor: Colors.black),
+                    onPressed: isRunning ? () => widget.db.pauseTableTimer(table) : null,
+                    icon: const Icon(Icons.pause),
+                    label: const Text('إيقاف'),
                   ),
-                  onPressed:
-                      isRunning ? () => widget.db.pauseTableTimer(table) : null,
-                  icon: const Icon(Icons.pause),
-                  label: const Text('إيقاف مؤقت',
-                      style: TextStyle(fontWeight: FontWeight.bold)),
-                ),
+                ],
                 OutlinedButton.icon(
                   onPressed: () => _showAttachDrinksDialog(table, inventory),
                   icon: const Icon(Icons.local_cafe),
-                  label: const Text('إضافة مشاريب للترابيزة'),
+                  label: const Text('إضافة مشاريب (Hold)'),
                 ),
                 ElevatedButton.icon(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.redAccent,
-                    foregroundColor: Colors.white,
-                  ),
-                  onPressed: (table.currentElapsedSeconds > 0 ||
-                          table.attachedItems.isNotEmpty)
+                  style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent, foregroundColor: Colors.white),
+                  onPressed: (table.currentElapsedSeconds > 0 || table.attachedItems.isNotEmpty)
                       ? () => _confirmTableCheckout(table)
                       : null,
-                  icon: const Icon(Icons.receipt_long),
+                  icon: const Icon(Icons.receipt),
                   label: const Text('إنهاء وحساب'),
                 ),
               ],
@@ -1897,20 +1553,14 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
   Widget _metricColumn(String label, String value, Color color) {
     return Column(
       children: [
-        Text(label,
-            style: const TextStyle(fontSize: 12, color: Colors.white70)),
-        const SizedBox(height: 4),
-        Text(
-          value,
-          style: TextStyle(
-              fontSize: 18, fontWeight: FontWeight.bold, color: color),
-        ),
+        Text(label, style: const TextStyle(fontSize: 11, color: Colors.white70)),
+        const SizedBox(height: 2),
+        Text(value, style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: color)),
       ],
     );
   }
 
-  Widget _buildPosSection(
-      List<InventoryItem> inventory, List<GamingTable> tables) {
+  Widget _buildPosSection(List<InventoryItem> inventory, List<GamingTable> tables) {
     double cartTotal = 0;
     final Map<InventoryItem, int> resolvedCart = {};
     for (final item in inventory) {
@@ -1926,18 +1576,15 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text(
-            'الكاشير والمشاريب',
-            style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-          ),
+          const Text('الكاشير والمشاريب', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
           const SizedBox(height: 12),
           Expanded(
             child: GridView.builder(
               gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-                maxCrossAxisExtent: 190,
-                mainAxisSpacing: 12,
-                crossAxisSpacing: 12,
-                childAspectRatio: 1.05,
+                maxCrossAxisExtent: 180,
+                mainAxisSpacing: 10,
+                crossAxisSpacing: 10,
+                childAspectRatio: 1.1,
               ),
               itemCount: inventory.length,
               itemBuilder: (context, index) {
@@ -1945,70 +1592,22 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                 final qtyInCart = _posCart[item.id] ?? 0;
 
                 return InkWell(
-                  onTap: item.stock > qtyInCart
-                      ? () => setState(() => _posCart[item.id] = qtyInCart + 1)
-                      : null,
-                  borderRadius: BorderRadius.circular(14),
+                  onTap: item.stock > qtyInCart ? () => setState(() => _posCart[item.id] = qtyInCart + 1) : null,
                   child: Card(
                     shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(14),
-                      side: BorderSide(
-                        color: qtyInCart > 0
-                            ? const Color(0xFF00C896)
-                            : Colors.white12,
-                        width: qtyInCart > 0 ? 2 : 1,
-                      ),
+                      borderRadius: BorderRadius.circular(12),
+                      side: BorderSide(color: qtyInCart > 0 ? const Color(0xFF00C896) : Colors.white12, width: 2),
                     ),
                     child: Padding(
-                      padding: const EdgeInsets.all(12),
+                      padding: const EdgeInsets.all(10),
                       child: Column(
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
-                          Text(
-                            'المتاح: ${item.stock}',
-                            style: const TextStyle(
-                                fontSize: 11, color: Colors.white60),
-                          ),
-                          Text(
-                            item.name,
-                            style: const TextStyle(
-                                fontSize: 17, fontWeight: FontWeight.bold),
-                            textAlign: TextAlign.center,
-                          ),
-                          Text(
-                            '${item.price.toStringAsFixed(1)} ج.م',
-                            style: const TextStyle(
-                                color: Color(0xFF00C896),
-                                fontWeight: FontWeight.bold),
-                          ),
+                          Text('مخزن: ${item.stock}', style: const TextStyle(fontSize: 10, color: Colors.white60)),
+                          Text(item.name, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                          Text('${item.price} ج.م', style: const TextStyle(color: Color(0xFF00C896), fontWeight: FontWeight.bold)),
                           if (qtyInCart > 0)
-                            Row(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              children: [
-                                IconButton(
-                                  icon: const Icon(Icons.remove_circle_outline,
-                                      size: 20),
-                                  onPressed: () => setState(() {
-                                    if (qtyInCart <= 1) {
-                                      _posCart.remove(item.id);
-                                    } else {
-                                      _posCart[item.id] = qtyInCart - 1;
-                                    }
-                                  }),
-                                ),
-                                Text('$qtyInCart',
-                                    style: const TextStyle(
-                                        fontWeight: FontWeight.bold)),
-                                IconButton(
-                                  icon: const Icon(Icons.add_circle_outline,
-                                      size: 20),
-                                  onPressed: item.stock > qtyInCart
-                                      ? () => setState(() =>
-                                          _posCart[item.id] = qtyInCart + 1)
-                                      : null,
-                                ),
-                              ],
-                            ),
+                            Text('الكمية: $qtyInCart', style: const TextStyle(color: Colors.amber, fontWeight: FontWeight.bold)),
                         ],
                       ),
                     ),
@@ -2019,52 +1618,29 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
           ),
           if (resolvedCart.isNotEmpty)
             Container(
-              padding: const EdgeInsets.all(14),
-              decoration: BoxDecoration(
-                color: const Color(0xFF181E2C),
-                borderRadius: BorderRadius.circular(14),
-                border: Border.all(color: const Color(0xFF00C896)),
-              ),
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(color: const Color(0xFF181E2C), borderRadius: BorderRadius.circular(12)),
               child: Column(
                 children: [
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                    children: [
-                      Text(
-                        'الإجمالي: ${cartTotal.toStringAsFixed(1)} ج.م',
-                        style: const TextStyle(
-                            fontSize: 17, fontWeight: FontWeight.bold),
-                      ),
-                      TextButton(
-                        onPressed: () => setState(() => _posCart.clear()),
-                        child: const Text('إلغاء',
-                            style: TextStyle(color: Colors.redAccent)),
-                      ),
-                    ],
-                  ),
+                  Text('الإجمالي: ${cartTotal.toStringAsFixed(1)} ج.م', style: const TextStyle(fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 8),
                   Wrap(
-                    spacing: 10,
-                    runSpacing: 10,
+                    spacing: 8,
+                    runSpacing: 8,
                     children: [
-                      ElevatedButton.icon(
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: const Color(0xFF00C896),
-                          foregroundColor: Colors.black,
-                        ),
+                      ElevatedButton(
                         onPressed: () async {
                           await widget.db.checkoutDirectPos(resolvedCart);
                           setState(() => _posCart.clear());
                         },
-                        icon: const Icon(Icons.check_circle),
-                        label: const Text('تأكيد الطلب (كاشير)'),
+                        child: const Text('بيع مباشر كاشير'),
                       ),
                       ...tables.map((t) => OutlinedButton(
                             onPressed: () async {
-                              await widget.db
-                                  .attachDrinksToTable(t, resolvedCart);
+                              await widget.db.attachDrinksToTable(t, resolvedCart);
                               setState(() => _posCart.clear());
                             },
-                            child: Text('إضافة لـ ${t.name}'),
+                            child: Text('إضافة لـ ${t.name} (Hold)'),
                           )),
                     ],
                   ),
@@ -2076,55 +1652,25 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
     );
   }
 
-  Widget _buildInventorySection(
-      List<InventoryItem> inventory, List<GamingTable> tables) {
+  Widget _buildInventorySection(List<InventoryItem> inventory) {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
         Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
-            const Text(
-              'إدارة المخزن وتعديل الأسعار',
-              style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-            ),
-            ElevatedButton.icon(
-              style: ElevatedButton.styleFrom(
-                backgroundColor: const Color(0xFF00C896),
-                foregroundColor: Colors.black,
-              ),
+            const Text('إدارة المخزن', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            ElevatedButton(
               onPressed: _showAddInventoryDialog,
-              icon: const Icon(Icons.add),
-              label: const Text('إضافة صنف'),
+              child: const Text('إضافة صنف'),
             ),
           ],
         ),
-        const SizedBox(height: 16),
+        const SizedBox(height: 12),
         ...inventory.map((item) => Card(
-              margin: const EdgeInsets.only(bottom: 10),
               child: ListTile(
-                title: Text(item.name,
-                    style: const TextStyle(fontWeight: FontWeight.bold)),
-                subtitle: Text(
-                    'السعر: ${item.price.toStringAsFixed(1)} ج.م | المخزن: ${item.stock}'),
-                trailing: Wrap(
-                  spacing: 8,
-                  children: [
-                    OutlinedButton(
-                      onPressed: () => _showEditPriceDialog(item),
-                      child: const Text('السعر'),
-                    ),
-                    OutlinedButton(
-                      onPressed: () => _showEditStockDialog(item),
-                      child: const Text('الكمية'),
-                    ),
-                    IconButton(
-                      icon: const Icon(Icons.delete_outline,
-                          color: Colors.redAccent),
-                      onPressed: () => widget.db.deleteInventoryItem(item),
-                    ),
-                  ],
-                ),
+                title: Text(item.name, style: const TextStyle(fontWeight: FontWeight.bold)),
+                subtitle: Text('السعر: ${item.price} ج.م | المخزن: ${item.stock}'),
               ),
             )),
       ],
@@ -2133,229 +1679,28 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
 
   Widget _buildReportsSection(List<SaleRecord> sales, List<AuditLog> logs) {
     double drinksRev = 0;
-    double billiardRev = 0;
-    double pingPongRev = 0;
-    int billiardSeconds = 0;
-    int pingPongSeconds = 0;
-    final Map<String, int> itemBreakdown = {};
-
+    double tableRev = 0;
     for (final s in sales) {
       drinksRev += s.drinksRevenue;
-      if (s.type == 'billiard_checkout') {
-        billiardRev += s.timeRevenue;
-        billiardSeconds += s.playedSeconds;
-      } else if (s.type == 'pingpong_checkout') {
-        pingPongRev += s.timeRevenue;
-        pingPongSeconds += s.playedSeconds;
-      }
-      for (final item in s.soldItems) {
-        itemBreakdown[item.name] = (itemBreakdown[item.name] ?? 0) + item.qty;
-      }
+      tableRev += s.timeRevenue;
     }
+    final grandTotal = drinksRev + tableRev;
 
-    final grandTotal = drinksRev + billiardRev + pingPongRev;
-
-    return StreamBuilder<List<ClosedDaySummary>>(
-      stream: widget.db.streamClosedDays(),
-      builder: (context, closedSnap) {
-        final closedDays = closedSnap.data ?? [];
-
-        ClosedDaySummary? highestDay;
-        for (final d in closedDays) {
-          if (highestDay == null || d.grandTotal > highestDay.grandTotal) {
-            highestDay = d;
-          }
-        }
-
-        return ListView(
-          padding: const EdgeInsets.all(16),
-          children: [
-            if (highestDay != null)
-              Card(
-                color: const Color(0xFF1D2331),
-                margin: const EdgeInsets.only(bottom: 16),
-                shape: RoundedRectangleBorder(
-                  borderRadius: BorderRadius.circular(14),
-                  side: const BorderSide(color: Colors.pinkAccent, width: 1),
-                ),
-                child: Padding(
-                  padding: const EdgeInsets.all(16),
-                  child: Column(
-                    children: [
-                      const Text('أعلى يوم',
-                          style:
-                              TextStyle(fontSize: 14, color: Colors.white70)),
-                      const SizedBox(height: 6),
-                      Text(
-                        highestDay.dateLabel,
-                        style: const TextStyle(
-                          fontSize: 22,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.pinkAccent,
-                        ),
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        '${highestDay.grandTotal.toStringAsFixed(1)} ج.م',
-                        style: const TextStyle(
-                            fontSize: 16, color: Color(0xFF00C896)),
-                      ),
-                    ],
-                  ),
-                ),
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        ElevatedButton.styleFrom().noDefaultStyle
+            ? const SizedBox()
+            : ElevatedButton(
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
+                onPressed: () => _confirmCloseDayDialog(drinksRev, tableRev, grandTotal),
+                child: const Text('تقفيل اليوم وتصفير الشيفت', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
               ),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-              decoration: BoxDecoration(
-                color: const Color(0xFF1D2331),
-                borderRadius: BorderRadius.circular(14),
-              ),
-              child: Wrap(
-                spacing: 12,
-                runSpacing: 10,
-                alignment: WrapAlignment.spaceBetween,
-                crossAxisAlignment: WrapCrossAlignment.center,
-                children: [
-                  ElevatedButton.icon(
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFF00C853),
-                      foregroundColor: Colors.white,
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 24, vertical: 12),
-                      shape: const StadiumBorder(),
-                    ),
-                    onPressed: () => _confirmCloseDayDialog(
-                      drinksRev: drinksRev,
-                      billiardRev: billiardRev,
-                      pingPongRev: pingPongRev,
-                      grandTotal: grandTotal,
-                    ),
-                    icon: const Icon(Icons.lock_clock),
-                    label: const Text(
-                      'تقفيل اليوم',
-                      style:
-                          TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-                    ),
-                  ),
-                  Wrap(
-                    spacing: 8,
-                    children: [
-                      OutlinedButton.icon(
-                        onPressed: () => ExportService.exportDailyPdfReport(
-                          sales: sales,
-                          logs: logs,
-                          drinksRev: drinksRev,
-                          billiardRev: billiardRev,
-                          pingPongRev: pingPongRev,
-                          grandTotal: grandTotal,
-                          itemBreakdown: itemBreakdown,
-                        ),
-                        icon: const Icon(Icons.picture_as_pdf),
-                        label: const Text('PDF'),
-                      ),
-                      OutlinedButton.icon(
-                        onPressed: () async {
-                          final msg = await ExportService.exportExcelReport(
-                            sales: sales,
-                            logs: logs,
-                            drinksRev: drinksRev,
-                            billiardRev: billiardRev,
-                            pingPongRev: pingPongRev,
-                            grandTotal: grandTotal,
-                            itemBreakdown: itemBreakdown,
-                          );
-                          if (mounted) {
-                            ScaffoldMessenger.of(context)
-                                .showSnackBar(SnackBar(content: Text(msg)));
-                          }
-                        },
-                        icon: const Icon(Icons.table_view),
-                        label: const Text('إكسيل'),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 16),
-            Wrap(
-              spacing: 12,
-              runSpacing: 12,
-              children: [
-                _summaryReportCard(
-                    'إيراد المشاريب الحالي', drinksRev, Colors.amber),
-                _summaryReportCard(
-                    'البلياردو (${(billiardSeconds / 3600).toStringAsFixed(1)} س)',
-                    billiardRev,
-                    Colors.cyanAccent),
-                _summaryReportCard(
-                    'البينج بونج (${(pingPongSeconds / 3600).toStringAsFixed(1)} س)',
-                    pingPongRev,
-                    Colors.purpleAccent),
-                _summaryReportCard('إجمالي الشيفت الحالي', grandTotal,
-                    const Color(0xFF00C896)),
-              ],
-            ),
-            const SizedBox(height: 24),
-            const Text('سجل الأيام المتقفلة السابقة:',
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 10),
-            if (closedDays.isEmpty)
-              const Text('مفيش أيام اتقفلت لسه.')
-            else
-              ...closedDays.map((day) => Card(
-                    color: const Color(0xFF1D2331),
-                    margin: const EdgeInsets.only(bottom: 8),
-                    child: ListTile(
-                      title: Text(
-                        day.dateLabel,
-                        style: const TextStyle(fontWeight: FontWeight.bold),
-                      ),
-                      subtitle: Text(
-                        'مشاريب: ${day.drinksRevenue.toStringAsFixed(0)} | بلياردو: ${day.billiardRevenue.toStringAsFixed(0)} | بينج: ${day.pingPongRevenue.toStringAsFixed(0)}',
-                        style: const TextStyle(fontSize: 12),
-                      ),
-                      trailing: Text(
-                        '${day.grandTotal.toStringAsFixed(1)} ج.م',
-                        style: const TextStyle(
-                          fontSize: 16,
-                          fontWeight: FontWeight.bold,
-                          color: Color(0xFF00C896),
-                        ),
-                      ),
-                    ),
-                  )),
-          ],
-        );
-      },
-    );
-  }
-
-  Widget _summaryReportCard(String title, double amount, Color accent) {
-    return SizedBox(
-      width: 220,
-      child: Card(
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(12),
-          side: BorderSide(color: accent.withValues(alpha: 0.6)),
-        ),
-        child: Padding(
-          padding: const EdgeInsets.all(16),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(title,
-                  style: const TextStyle(fontSize: 13, color: Colors.white70)),
-              const SizedBox(height: 8),
-              Text(
-                '${amount.toStringAsFixed(2)} ج.م',
-                style: TextStyle(
-                    fontSize: 20, fontWeight: FontWeight.bold, color: accent),
-              ),
-            ],
-          ),
-        ),
-      ),
+        const SizedBox(height: 16),
+        Text('إيراد المشاريب: ${drinksRev.toStringAsFixed(1)} ج.م'),
+        Text('إيراد الترابيزات: ${tableRev.toStringAsFixed(1)} ج.م'),
+        Text('الإجمالي: ${grandTotal.toStringAsFixed(1)} ج.م', style: const TextStyle(color: Color(0xFF00C896), fontWeight: FontWeight.bold)),
+      ],
     );
   }
 
@@ -2366,113 +1711,70 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
       itemBuilder: (context, index) {
         final log = logs[index];
         return Card(
-          margin: const EdgeInsets.only(bottom: 8),
           child: ListTile(
-            leading: const Icon(Icons.notifications_active,
-                color: Colors.amberAccent),
-            title: Text(log.title,
-                style: const TextStyle(fontWeight: FontWeight.bold)),
-            subtitle: Text(
-                '${log.message}\nقبل: ${log.beforeVal} ⬅ بعد: ${log.afterVal}'),
-            trailing: Text(
-              intl.DateFormat('hh:mm a').format(log.timestamp),
-              style: const TextStyle(fontSize: 12, color: Colors.white54),
-            ),
+            title: Text(log.title),
+            subtitle: Text(log.message),
           ),
         );
       },
     );
   }
 
-  void _confirmCloseDayDialog({
-    required double drinksRev,
-    required double billiardRev,
-    required double pingPongRev,
-    required double grandTotal,
-  }) {
+  void _showAddTableDialog() {
+    final nameCtrl = TextEditingController();
+    final rateCtrl = TextEditingController(text: '0');
+    String typeVal = 'normal';
+
     showDialog(
       context: context,
-      builder: (dialogContext) => AlertDialog(
-        title: const Text('تأكيد تقفيل اليوم وتصفير الشيفت'),
-        content: Text(
-          'هيتم ترحيل حسابات الشيفت الحالي (${grandTotal.toStringAsFixed(1)} ج.م) بالإضافة لأي ترابيزة مفتوحة، وتصفير العدادات بالكامل ليوم جديد.',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialogContext),
-            child: const Text('إلغاء'),
+      builder: (_) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: const Text('إضافة ترابيزة جديدة'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(controller: nameCtrl, decoration: const InputDecoration(labelText: 'اسم الترابيزة')),
+              DropdownButtonFormField<String>(
+                value: typeVal,
+                items: const [
+                  DropdownMenuItem(value: 'normal', child: Text('ترابيزة عادية (قعدات)')),
+                  DropdownMenuItem(value: 'gaming', child: Text('ترابيزة ألعاب (بساعة)')),
+                ],
+                onChanged: (val) => setDialogState(() => typeVal = val ?? 'normal'),
+              ),
+              if (typeVal == 'gaming')
+                TextField(controller: rateCtrl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'سعر الساعة')),
+            ],
           ),
-          ElevatedButton(
-            style: ElevatedButton.styleFrom(
-              backgroundColor: const Color(0xFF00C853),
-              foregroundColor: Colors.white,
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(context), child: const Text('إلغاء')),
+            ElevatedButton(
+              onPressed: () {
+                final name = nameCtrl.text.trim();
+                final rate = double.tryParse(rateCtrl.text) ?? 0;
+                if (name.isNotEmpty) {
+                  widget.db.addNewTable(name: name, type: typeVal, hourlyRate: rate);
+                  Navigator.pop(context);
+                }
+              },
+              child: const Text('إضافة'),
             ),
-            onPressed: () async {
-              Navigator.pop(dialogContext);
-              await widget.db.closeCurrentDayAndReset(
-                drinksRev: drinksRev,
-                billiardRev: billiardRev,
-                pingPongRev: pingPongRev,
-                grandTotal: grandTotal,
-              );
-              if (mounted) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text(
-                        'تم تقفيل اليوم وتصفير جميع الحسابات والترابيزات!'),
-                  ),
-                );
-              }
-            },
-            child: const Text('نعم، قفّل وصفر الآن'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  void _showEditHourlyRateDialog(GamingTable table) {
-    final ctrl =
-        TextEditingController(text: table.hourlyRate.toStringAsFixed(0));
-    showDialog(
-      context: context,
-      builder: (_) => AlertDialog(
-        title: Text('تعديل سعر الساعة - ${table.name}'),
-        content: TextField(
-          controller: ctrl,
-          keyboardType: TextInputType.number,
-          decoration: const InputDecoration(labelText: 'سعر الساعة (ج.م)'),
+          ],
         ),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('إلغاء')),
-          ElevatedButton(
-            onPressed: () {
-              final val = double.tryParse(ctrl.text);
-              if (val != null && val > 0) {
-                widget.db.updateTableHourlyRate(table, val);
-                Navigator.pop(context);
-              }
-            },
-            child: const Text('حفظ'),
-          ),
-        ],
       ),
     );
   }
 
-  void _showAttachDrinksDialog(
-      GamingTable table, List<InventoryItem> inventory) {
+  void _showAttachDrinksDialog(GamingTable table, List<InventoryItem> inventory) {
     final Map<InventoryItem, int> tempSelection = {};
     showDialog(
       context: context,
       builder: (_) => StatefulBuilder(
         builder: (context, setDialogState) => AlertDialog(
-          title: Text('إضافة مشاريب لـ ${table.name}'),
+          title: Text('إضافة مشاريب (Hold) لـ ${table.name}'),
           content: SizedBox(
             width: 400,
-            height: 320,
+            height: 300,
             child: ListView(
               children: inventory.map((item) {
                 final count = tempSelection[item] ?? 0;
@@ -2483,18 +1785,12 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                     children: [
                       IconButton(
                         icon: const Icon(Icons.remove),
-                        onPressed: count > 0
-                            ? () => setDialogState(
-                                () => tempSelection[item] = count - 1)
-                            : null,
+                        onPressed: count > 0 ? () => setDialogState(() => tempSelection[item] = count - 1) : null,
                       ),
                       Text('$count'),
                       IconButton(
                         icon: const Icon(Icons.add),
-                        onPressed: item.stock > count
-                            ? () => setDialogState(
-                                () => tempSelection[item] = count + 1)
-                            : null,
+                        onPressed: item.stock > count ? () => setDialogState(() => tempSelection[item] = count + 1) : null,
                       ),
                     ],
                   ),
@@ -2503,9 +1799,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
             ),
           ),
           actions: [
-            TextButton(
-                onPressed: () => Navigator.pop(context),
-                child: const Text('إلغاء')),
+            TextButton(onPressed: () => Navigator.pop(context), child: const Text('إلغاء')),
             ElevatedButton(
               onPressed: () {
                 tempSelection.removeWhere((_, v) => v <= 0);
@@ -2514,7 +1808,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                 }
                 Navigator.pop(context);
               },
-              child: const Text('إضافة'),
+              child: const Text('تأكيد (تفضيل Hold)'),
             ),
           ],
         ),
@@ -2527,14 +1821,9 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
       context: context,
       builder: (_) => AlertDialog(
         title: Text('حساب الترابيزة - ${table.name}'),
-        content: Text(
-          'الإجمالي المطلوب دفعه: ${table.grandTotal.toStringAsFixed(2)} ج.م',
-          style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-        ),
+        content: Text('الإجمالي المطلوب: ${table.grandTotal.toStringAsFixed(2)} ج.م', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
         actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('رجوع')),
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('رجوع')),
           ElevatedButton(
             onPressed: () async {
               await widget.db.endAndCheckoutTable(table);
@@ -2547,114 +1836,55 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
     );
   }
 
+  void _confirmCloseDayDialog(double dRev, double tRev, double gTotal) {
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('تقفيل اليوم'),
+        content: Text('هل تريد تقفيل اليوم بإجمالي ${gTotal.toStringAsFixed(1)} ج.م وتصفير الشيفت؟'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('إلغاء')),
+          ElevatedButton(
+            onPressed: () async {
+              await widget.db.closeCurrentDayAndReset(drinksRev: dRev, tableRev: tRev, grandTotal: gTotal);
+              if (mounted) Navigator.pop(context);
+            },
+            child: const Text('نعم، قفّل'),
+          ),
+        ],
+      ),
+    );
+  }
+
   void _showAddInventoryDialog() {
     final nameCtrl = TextEditingController();
     final priceCtrl = TextEditingController();
     final stockCtrl = TextEditingController();
-
     showDialog(
       context: context,
       builder: (_) => AlertDialog(
-        title: const Text('إضافة صنف جديد'),
+        title: const Text('إضافة صنف'),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            TextField(
-              controller: nameCtrl,
-              decoration: const InputDecoration(labelText: 'اسم الصنف'),
-            ),
-            TextField(
-              controller: priceCtrl,
-              keyboardType: TextInputType.number,
-              decoration: const InputDecoration(labelText: 'السعر (ج.م)'),
-            ),
-            TextField(
-              controller: stockCtrl,
-              keyboardType: TextInputType.number,
-              decoration: const InputDecoration(labelText: 'الكمية بالمخزن'),
-            ),
+            TextField(controller: nameCtrl, decoration: const InputDecoration(labelText: 'اسم الصنف')),
+            TextField(controller: priceCtrl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'السعر')),
+            TextField(controller: stockCtrl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'الكمية')),
           ],
         ),
         actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('إلغاء')),
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('إلغاء')),
           ElevatedButton(
             onPressed: () {
               final name = nameCtrl.text.trim();
               final price = double.tryParse(priceCtrl.text) ?? 0;
               final stock = int.tryParse(stockCtrl.text) ?? 0;
               if (name.isNotEmpty && price > 0) {
-                widget.db.addNewInventoryItem(
-                  name: name,
-                  price: price,
-                  stock: stock,
-                  threshold: 10,
-                );
-                Navigator.pop(context, true);
+                widget.db.addNewInventoryItem(name: name, price: price, stock: stock, threshold: 5);
+                Navigator.pop(context);
               }
             },
             child: const Text('إضافة'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  void _showEditPriceDialog(InventoryItem item) {
-    final ctrl = TextEditingController(text: item.price.toStringAsFixed(1));
-    showDialog(
-      context: context,
-      builder: (_) => AlertDialog(
-        title: Text('تعديل سعر: ${item.name}'),
-        content: TextField(
-          controller: ctrl,
-          keyboardType: TextInputType.number,
-        ),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('إلغاء')),
-          ElevatedButton(
-            onPressed: () {
-              final val = double.tryParse(ctrl.text);
-              if (val != null && val > 0) {
-                widget.db.updateItemPrice(item, val);
-                Navigator.pop(context);
-              }
-            },
-            child: const Text('حفظ'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  void _showEditStockDialog(InventoryItem item) {
-    final ctrl = TextEditingController(text: item.stock.toString());
-    showDialog(
-      context: context,
-      builder: (_) => AlertDialog(
-        title: Text('تعديل الكمية: ${item.name}'),
-        content: TextField(
-          controller: ctrl,
-          keyboardType: TextInputType.number,
-        ),
-        actions: [
-          TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text('إلغاء')),
-          ElevatedButton(
-            onPressed: () {
-              val:
-              int.tryParse(ctrl.text);
-              final val = int.tryParse(ctrl.text);
-              if (val != null && val >= 0) {
-                widget.db.updateItemStock(item, val);
-                Navigator.pop(context);
-              }
-            },
-            child: const Text('حفظ'),
           ),
         ],
       ),
