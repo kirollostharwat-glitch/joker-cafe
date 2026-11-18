@@ -1,11 +1,12 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:excel/excel.dart' hide Border;
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:intl/intl.dart' as intl;
@@ -16,6 +17,9 @@ import 'package:printing/printing.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
+
+final GlobalKey<ScaffoldMessengerState> rootScaffoldMessengerKey =
+    GlobalKey<ScaffoldMessengerState>();
 
 // =============================================================================
 // 1. DATA MODELS
@@ -39,21 +43,26 @@ class InventoryItem {
   bool get isLowStock => stock <= lowStockThreshold;
 
   Map<String, dynamic> toMap() => {
+        'id': id,
         'name': name,
         'price': price,
         'stock': stock,
         'lowStockThreshold': lowStockThreshold,
       };
 
-  factory InventoryItem.fromDoc(DocumentSnapshot doc) {
-    final data = doc.data() as Map<String, dynamic>? ?? {};
+  factory InventoryItem.fromMap(Map<String, dynamic> data, [String? docId]) {
     return InventoryItem(
-      id: doc.id,
+      id: docId ?? data['id'] ?? const Uuid().v4(),
       name: data['name'] ?? '',
       price: (data['price'] ?? 0).toDouble(),
       stock: (data['stock'] ?? 0).toInt(),
       lowStockThreshold: (data['lowStockThreshold'] ?? 5).toInt(),
     );
+  }
+
+  factory InventoryItem.fromDoc(DocumentSnapshot doc) {
+    final data = doc.data() as Map<String, dynamic>? ?? {};
+    return InventoryItem.fromMap(data, doc.id);
   }
 }
 
@@ -91,7 +100,7 @@ class GamingTable {
   final String id;
   final String name;
   final double hourlyRate;
-  final String status;
+  final String status; // 'idle', 'running', 'paused'
   final DateTime? lastStartTime;
   final int accumulatedSeconds;
   final List<AttachedItem> attachedItems;
@@ -129,32 +138,46 @@ class GamingTable {
     return '$hrs:$mins:$secs';
   }
 
-  Map<String, dynamic> toMap() => {
+  Map<String, dynamic> toMap({bool forLocal = false}) => {
+        'id': id,
         'name': name,
         'hourlyRate': hourlyRate,
         'status': status,
-        'lastStartTime':
-            lastStartTime != null ? Timestamp.fromDate(lastStartTime!) : null,
+        'lastStartTime': lastStartTime == null
+            ? null
+            : (forLocal
+                ? lastStartTime!.toIso8601String()
+                : Timestamp.fromDate(lastStartTime!)),
         'accumulatedSeconds': accumulatedSeconds,
         'attachedItems': attachedItems.map((e) => e.toMap()).toList(),
       };
 
-  factory GamingTable.fromDoc(DocumentSnapshot doc) {
-    final data = doc.data() as Map<String, dynamic>? ?? {};
+  factory GamingTable.fromMap(Map<String, dynamic> data, [String? docId]) {
     final rawList = data['attachedItems'] as List<dynamic>? ?? [];
+    DateTime? parsedStart;
+    final rawStart = data['lastStartTime'];
+    if (rawStart is Timestamp) {
+      parsedStart = rawStart.toDate();
+    } else if (rawStart is String) {
+      parsedStart = DateTime.tryParse(rawStart);
+    }
+
     return GamingTable(
-      id: doc.id,
+      id: docId ?? data['id'] ?? 'billiard',
       name: data['name'] ?? '',
       hourlyRate: (data['hourlyRate'] ?? 50.0).toDouble(),
       status: data['status'] ?? 'idle',
-      lastStartTime: data['lastStartTime'] != null
-          ? (data['lastStartTime'] as Timestamp).toDate()
-          : null,
+      lastStartTime: parsedStart,
       accumulatedSeconds: (data['accumulatedSeconds'] ?? 0).toInt(),
       attachedItems: rawList
           .map((e) => AttachedItem.fromMap(Map<String, dynamic>.from(e)))
           .toList(),
     );
+  }
+
+  factory GamingTable.fromDoc(DocumentSnapshot doc) {
+    final data = doc.data() as Map<String, dynamic>? ?? {};
+    return GamingTable.fromMap(data, doc.id);
   }
 }
 
@@ -181,22 +204,32 @@ class SaleRecord {
     this.isClosed = false,
   });
 
-  Map<String, dynamic> toMap() => {
+  Map<String, dynamic> toMap({bool forLocal = false}) => {
+        'id': id,
         'type': type,
         'timeRevenue': timeRevenue,
         'drinksRevenue': drinksRevenue,
         'totalRevenue': totalRevenue,
         'playedSeconds': playedSeconds,
         'soldItems': soldItems.map((e) => e.toMap()).toList(),
-        'timestamp': Timestamp.fromDate(timestamp),
+        'timestamp': forLocal
+            ? timestamp.toIso8601String()
+            : Timestamp.fromDate(timestamp),
         'isClosed': isClosed,
       };
 
-  factory SaleRecord.fromDoc(DocumentSnapshot doc) {
-    final data = doc.data() as Map<String, dynamic>? ?? {};
+  factory SaleRecord.fromMap(Map<String, dynamic> data, [String? docId]) {
     final rawItems = data['soldItems'] as List<dynamic>? ?? [];
+    DateTime parsedTime = DateTime.now();
+    final rawTime = data['timestamp'];
+    if (rawTime is Timestamp) {
+      parsedTime = rawTime.toDate();
+    } else if (rawTime is String) {
+      parsedTime = DateTime.tryParse(rawTime) ?? DateTime.now();
+    }
+
     return SaleRecord(
-      id: doc.id,
+      id: docId ?? data['id'] ?? const Uuid().v4(),
       type: data['type'] ?? 'drinks_only',
       timeRevenue: (data['timeRevenue'] ?? 0).toDouble(),
       drinksRevenue: (data['drinksRevenue'] ?? 0).toDouble(),
@@ -205,11 +238,14 @@ class SaleRecord {
       soldItems: rawItems
           .map((e) => AttachedItem.fromMap(Map<String, dynamic>.from(e)))
           .toList(),
-      timestamp: data['timestamp'] != null
-          ? (data['timestamp'] as Timestamp).toDate()
-          : DateTime.now(),
+      timestamp: parsedTime,
       isClosed: data['isClosed'] ?? false,
     );
+  }
+
+  factory SaleRecord.fromDoc(DocumentSnapshot doc) {
+    final data = doc.data() as Map<String, dynamic>? ?? {};
+    return SaleRecord.fromMap(data, doc.id);
   }
 }
 
@@ -232,28 +268,41 @@ class ClosedDaySummary {
     required this.closedAt,
   });
 
-  Map<String, dynamic> toMap() => {
+  Map<String, dynamic> toMap({bool forLocal = false}) => {
+        'id': id,
         'dateLabel': dateLabel,
         'drinksRevenue': drinksRevenue,
         'billiardRevenue': billiardRevenue,
         'pingPongRevenue': pingPongRevenue,
         'grandTotal': grandTotal,
-        'closedAt': Timestamp.fromDate(closedAt),
+        'closedAt': forLocal
+            ? closedAt.toIso8601String()
+            : Timestamp.fromDate(closedAt),
       };
 
-  factory ClosedDaySummary.fromDoc(DocumentSnapshot doc) {
-    final data = doc.data() as Map<String, dynamic>? ?? {};
+  factory ClosedDaySummary.fromMap(Map<String, dynamic> data, [String? docId]) {
+    DateTime parsedTime = DateTime.now();
+    final rawTime = data['closedAt'];
+    if (rawTime is Timestamp) {
+      parsedTime = rawTime.toDate();
+    } else if (rawTime is String) {
+      parsedTime = DateTime.tryParse(rawTime) ?? DateTime.now();
+    }
+
     return ClosedDaySummary(
-      id: doc.id,
+      id: docId ?? data['id'] ?? const Uuid().v4(),
       dateLabel: data['dateLabel'] ?? '',
       drinksRevenue: (data['drinksRevenue'] ?? 0).toDouble(),
       billiardRevenue: (data['billiardRevenue'] ?? 0).toDouble(),
       pingPongRevenue: (data['pingPongRevenue'] ?? 0).toDouble(),
       grandTotal: (data['grandTotal'] ?? 0).toDouble(),
-      closedAt: data['closedAt'] != null
-          ? (data['closedAt'] as Timestamp).toDate()
-          : DateTime.now(),
+      closedAt: parsedTime,
     );
+  }
+
+  factory ClosedDaySummary.fromDoc(DocumentSnapshot doc) {
+    final data = doc.data() as Map<String, dynamic>? ?? {};
+    return ClosedDaySummary.fromMap(data, doc.id);
   }
 }
 
@@ -276,33 +325,46 @@ class AuditLog {
     required this.timestamp,
   });
 
-  Map<String, dynamic> toMap() => {
+  Map<String, dynamic> toMap({bool forLocal = false}) => {
+        'id': id,
         'title': title,
         'message': message,
         'beforeVal': beforeVal,
         'afterVal': afterVal,
         'deviceId': deviceId,
-        'timestamp': Timestamp.fromDate(timestamp),
+        'timestamp': forLocal
+            ? timestamp.toIso8601String()
+            : Timestamp.fromDate(timestamp),
       };
 
-  factory AuditLog.fromDoc(DocumentSnapshot doc) {
-    final data = doc.data() as Map<String, dynamic>? ?? {};
+  factory AuditLog.fromMap(Map<String, dynamic> data, [String? docId]) {
+    DateTime parsedTime = DateTime.now();
+    final rawTime = data['timestamp'];
+    if (rawTime is Timestamp) {
+      parsedTime = rawTime.toDate();
+    } else if (rawTime is String) {
+      parsedTime = DateTime.tryParse(rawTime) ?? DateTime.now();
+    }
+
     return AuditLog(
-      id: doc.id,
+      id: docId ?? data['id'] ?? const Uuid().v4(),
       title: data['title'] ?? '',
       message: data['message'] ?? '',
       beforeVal: data['beforeVal'] ?? '',
       afterVal: data['afterVal'] ?? '',
       deviceId: data['deviceId'] ?? '',
-      timestamp: data['timestamp'] != null
-          ? (data['timestamp'] as Timestamp).toDate()
-          : DateTime.now(),
+      timestamp: parsedTime,
     );
+  }
+
+  factory AuditLog.fromDoc(DocumentSnapshot doc) {
+    final data = doc.data() as Map<String, dynamic>? ?? {};
+    return AuditLog.fromMap(data, doc.id);
   }
 }
 
 // =============================================================================
-// 2. NOTIFICATION SERVICE
+// 2. CROSS-PLATFORM ALERT & SOUND NOTIFICATION SERVICE
 // =============================================================================
 
 class NotificationService {
@@ -310,90 +372,232 @@ class NotificationService {
   factory NotificationService() => _instance;
   NotificationService._internal();
 
-  final FlutterLocalNotificationsPlugin _plugin =
-      FlutterLocalNotificationsPlugin();
-
-  Future<void> init() async {
-    const androidSettings =
-        AndroidInitializationSettings('@mipmap/ic_launcher');
-
-    const windowsSettings = WindowsInitializationSettings(
-      appName: 'Joker Cafe',
-      appUserModelId: 'com.jokercafe.pos.admin',
-      guid: 'd49b0314-ee7a-4626-bf79-97cdb8a991bb',
-    );
-
-    const initSettings = InitializationSettings(
-      android: androidSettings,
-      windows: windowsSettings,
-    );
-
-    await _plugin.initialize(initSettings);
-
-    if (Platform.isAndroid) {
-      await _plugin
-          .resolvePlatformSpecificImplementation<
-              AndroidFlutterLocalNotificationsPlugin>()
-          ?.requestNotificationsPermission();
-    }
-  }
+  Future<void> init() async {}
 
   Future<void> showEgyptianAlert({
     required int id,
     required String title,
     required String body,
   }) async {
-    const androidDetails = AndroidNotificationDetails(
-      'joker_cafe_audit_channel',
-      'Joker Cafe - تنبيهات التعديلات والمخزن',
-      channelDescription: 'إشعارات فورية لتعديلات الأسعار والمخزن والترابيزات',
-      importance: Importance.max,
-      priority: Priority.high,
-    );
-
-    const windowsDetails = WindowsNotificationDetails();
-
-    const details = NotificationDetails(
-      android: androidDetails,
-      windows: windowsDetails,
-    );
-
-    await _plugin.show(id, title, body, details);
+    try {
+      SystemSound.play(SystemSoundType.alert);
+      rootScaffoldMessengerKey.currentState?.showSnackBar(
+        SnackBar(
+          behavior: SnackBarBehavior.floating,
+          backgroundColor: const Color(0xFF1D2331),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+            side: const BorderSide(color: Color(0xFF00C896), width: 1.5),
+          ),
+          duration: const Duration(seconds: 4),
+          content: Row(
+            children: [
+              const Icon(Icons.notifications_active, color: Color(0xFF00C896)),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      style: const TextStyle(
+                        fontWeight: FontWeight.bold,
+                        color: Color(0xFF00C896),
+                      ),
+                    ),
+                    Text(
+                      body,
+                      style: const TextStyle(color: Colors.white),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    } catch (_) {}
   }
 }
 
 // =============================================================================
-// 3. FIRESTORE SERVICE
+// 3. HYBRID FIRESTORE + LOCAL OFFLINE FALLBACK SERVICE
 // =============================================================================
 
 class FirestoreService {
-  final FirebaseFirestore _db = FirebaseFirestore.instance;
-  late final String deviceId;
+  FirebaseFirestore? _db;
+  bool useCloud = false;
+  late SharedPreferences _prefs;
+  late String deviceId;
   bool _isInitialAuditLoad = true;
 
-  Future<void> initAndSeed() async {
-    _db.settings = const Settings(
-      persistenceEnabled: true,
-      cacheSizeBytes: Settings.CACHE_SIZE_UNLIMITED,
-    );
+  final _tablesCtrl = StreamController<List<GamingTable>>.broadcast();
+  final _invCtrl = StreamController<List<InventoryItem>>.broadcast();
+  final _salesCtrl = StreamController<List<SaleRecord>>.broadcast();
+  final _closedDaysCtrl = StreamController<List<ClosedDaySummary>>.broadcast();
+  final _logsCtrl = StreamController<List<AuditLog>>.broadcast();
 
-    final prefs = await SharedPreferences.getInstance();
-    String? storedId = prefs.getString('device_instance_id');
+  List<GamingTable> _localTables = [];
+  List<InventoryItem> _localInv = [];
+  List<SaleRecord> _localSales = [];
+  List<ClosedDaySummary> _localClosedDays = [];
+  List<AuditLog> _localLogs = [];
+
+  Future<void> initAndSeed({required bool firebaseReady}) async {
+    _prefs = await SharedPreferences.getInstance();
+    String? storedId = _prefs.getString('device_instance_id');
     if (storedId == null) {
       storedId = const Uuid().v4();
-      await prefs.setString('device_instance_id', storedId);
+      await _prefs.setString('device_instance_id', storedId);
     }
     deviceId = storedId;
 
-    await _seedDefaultDataIfNeeded();
-    _listenToAuditLogsForNotifications();
+    if (firebaseReady) {
+      try {
+        _db = FirebaseFirestore.instance;
+        _db!.settings = const Settings(
+          persistenceEnabled: true,
+          cacheSizeBytes: Settings.CACHE_SIZE_UNLIMITED,
+        );
+        useCloud = true;
+      } catch (_) {
+        useCloud = false;
+      }
+    }
+
+    if (useCloud) {
+      await _seedCloudDataIfNeeded();
+      _listenToAuditLogsForNotifications();
+    } else {
+      _loadAndSeedLocalData();
+    }
   }
 
-  Future<void> _seedDefaultDataIfNeeded() async {
+  void _loadAndSeedLocalData() {
+    final tRaw = _prefs.getString('local_tables');
+    if (tRaw != null) {
+      final list = jsonDecode(tRaw) as List;
+      _localTables = list
+          .map((e) => GamingTable.fromMap(Map<String, dynamic>.from(e)))
+          .toList();
+    } else {
+      _localTables = [
+        GamingTable(
+          id: 'billiard',
+          name: 'ترابيزة البلياردو',
+          hourlyRate: 60.0,
+          status: 'idle',
+          accumulatedSeconds: 0,
+          attachedItems: [],
+        ),
+        GamingTable(
+          id: 'pingpong',
+          name: 'ترابيزة البينج بونج',
+          hourlyRate: 45.0,
+          status: 'idle',
+          accumulatedSeconds: 0,
+          attachedItems: [],
+        ),
+      ];
+    }
+
+    final iRaw = _prefs.getString('local_inv');
+    if (iRaw != null) {
+      final list = jsonDecode(iRaw) as List;
+      _localInv = list
+          .map((e) => InventoryItem.fromMap(Map<String, dynamic>.from(e)))
+          .toList();
+    } else {
+      _localInv = [
+        InventoryItem(
+            id: '1',
+            name: 'شاي',
+            price: 15.0,
+            stock: 100,
+            lowStockThreshold: 15),
+        InventoryItem(
+            id: '2',
+            name: 'قهوة تركي',
+            price: 25.0,
+            stock: 60,
+            lowStockThreshold: 10),
+        InventoryItem(
+            id: '3',
+            name: 'نسكافيه',
+            price: 30.0,
+            stock: 45,
+            lowStockThreshold: 10),
+        InventoryItem(
+            id: '4',
+            name: 'بيبسي',
+            price: 20.0,
+            stock: 50,
+            lowStockThreshold: 12),
+        InventoryItem(
+            id: '5',
+            name: 'مية معدنية',
+            price: 10.0,
+            stock: 80,
+            lowStockThreshold: 20),
+      ];
+    }
+
+    final sRaw = _prefs.getString('local_sales');
+    if (sRaw != null) {
+      final list = jsonDecode(sRaw) as List;
+      _localSales = list
+          .map((e) => SaleRecord.fromMap(Map<String, dynamic>.from(e)))
+          .toList();
+    }
+
+    final cRaw = _prefs.getString('local_closed_days');
+    if (cRaw != null) {
+      final list = jsonDecode(cRaw) as List;
+      _localClosedDays = list
+          .map((e) => ClosedDaySummary.fromMap(Map<String, dynamic>.from(e)))
+          .toList();
+    }
+
+    final lRaw = _prefs.getString('local_logs');
+    if (lRaw != null) {
+      final list = jsonDecode(lRaw) as List;
+      _localLogs = list
+          .map((e) => AuditLog.fromMap(Map<String, dynamic>.from(e)))
+          .toList();
+    }
+
+    _saveAndEmitLocal();
+  }
+
+  void _saveAndEmitLocal() {
+    _prefs.setString(
+        'local_tables',
+        jsonEncode(
+            _localTables.map((e) => e.toMap(forLocal: true)).toList()));
+    _prefs.setString(
+        'local_inv', jsonEncode(_localInv.map((e) => e.toMap()).toList()));
+    _prefs.setString('local_sales',
+        jsonEncode(_localSales.map((e) => e.toMap(forLocal: true)).toList()));
+    _prefs.setString(
+        'local_closed_days',
+        jsonEncode(
+            _localClosedDays.map((e) => e.toMap(forLocal: true)).toList()));
+    _prefs.setString('local_logs',
+        jsonEncode(_localLogs.map((e) => e.toMap(forLocal: true)).toList()));
+
+    _tablesCtrl.add(List.from(_localTables));
+    _invCtrl.add(List.from(_localInv));
+    _salesCtrl.add(_localSales.where((s) => !s.isClosed).toList());
+    _closedDaysCtrl.add(List.from(_localClosedDays));
+    _logsCtrl.add(List.from(_localLogs));
+  }
+
+  Future<void> _seedCloudDataIfNeeded() async {
     try {
-      final tablesSnap = await _db.collection('tables').get();
+      final tablesSnap = await _db!.collection('tables').get();
       if (tablesSnap.docs.isEmpty) {
-        await _db.collection('tables').doc('billiard').set(GamingTable(
+        await _db!.collection('tables').doc('billiard').set(GamingTable(
               id: 'billiard',
               name: 'ترابيزة البلياردو',
               hourlyRate: 60.0,
@@ -402,7 +606,7 @@ class FirestoreService {
               attachedItems: [],
             ).toMap());
 
-        await _db.collection('tables').doc('pingpong').set(GamingTable(
+        await _db!.collection('tables').doc('pingpong').set(GamingTable(
               id: 'pingpong',
               name: 'ترابيزة البينج بونج',
               hourlyRate: 45.0,
@@ -412,7 +616,7 @@ class FirestoreService {
             ).toMap());
       }
 
-      final invSnap = await _db.collection('inventory').get();
+      final invSnap = await _db!.collection('inventory').get();
       if (invSnap.docs.isEmpty) {
         final initialDrinks = [
           {'name': 'شاي', 'price': 15.0, 'stock': 100, 'threshold': 15},
@@ -423,7 +627,7 @@ class FirestoreService {
         ];
 
         for (final item in initialDrinks) {
-          await _db.collection('inventory').add({
+          await _db!.collection('inventory').add({
             'name': item['name'],
             'price': item['price'],
             'stock': item['stock'],
@@ -435,7 +639,7 @@ class FirestoreService {
   }
 
   void _listenToAuditLogsForNotifications() {
-    _db
+    _db!
         .collection('audit_logs')
         .orderBy('timestamp', descending: true)
         .limit(20)
@@ -468,52 +672,104 @@ class FirestoreService {
     required String beforeVal,
     required String afterVal,
   }) async {
-    await _db.collection('audit_logs').add(AuditLog(
-          id: '',
-          title: title,
-          message: message,
-          beforeVal: beforeVal,
-          afterVal: afterVal,
-          deviceId: deviceId,
-          timestamp: DateTime.now(),
-        ).toMap());
+    final log = AuditLog(
+      id: const Uuid().v4(),
+      title: title,
+      message: message,
+      beforeVal: beforeVal,
+      afterVal: afterVal,
+      deviceId: deviceId,
+      timestamp: DateTime.now(),
+    );
+
+    if (useCloud) {
+      await _db!.collection('audit_logs').add(log.toMap());
+    } else {
+      _localLogs.insert(0, log);
+      _saveAndEmitLocal();
+    }
   }
 
-  Stream<List<GamingTable>> streamTables() => _db
-      .collection('tables')
-      .snapshots()
-      .map((s) => s.docs.map(GamingTable.fromDoc).toList());
+  Stream<List<GamingTable>> streamTables() {
+    if (useCloud) {
+      return _db!
+          .collection('tables')
+          .snapshots()
+          .map((s) => s.docs.map(GamingTable.fromDoc).toList());
+    }
+    Future.microtask(() => _tablesCtrl.add(List.from(_localTables)));
+    return _tablesCtrl.stream;
+  }
 
-  Stream<List<InventoryItem>> streamInventory() => _db
-      .collection('inventory')
-      .snapshots()
-      .map((s) => s.docs.map(InventoryItem.fromDoc).toList());
+  Stream<List<InventoryItem>> streamInventory() {
+    if (useCloud) {
+      return _db!
+          .collection('inventory')
+          .snapshots()
+          .map((s) => s.docs.map(InventoryItem.fromDoc).toList());
+    }
+    Future.microtask(() => _invCtrl.add(List.from(_localInv)));
+    return _invCtrl.stream;
+  }
 
   Stream<List<SaleRecord>> streamTodaySales() {
-    return _db.collection('sales').snapshots().map((s) => s.docs
-        .map(SaleRecord.fromDoc)
-        .where((sale) => !sale.isClosed)
-        .toList());
+    if (useCloud) {
+      return _db!.collection('sales').snapshots().map((s) => s.docs
+          .map(SaleRecord.fromDoc)
+          .where((sale) => !sale.isClosed)
+          .toList());
+    }
+    Future.microtask(
+        () => _salesCtrl.add(_localSales.where((s) => !s.isClosed).toList()));
+    return _salesCtrl.stream;
   }
 
-  Stream<List<ClosedDaySummary>> streamClosedDays() => _db
-      .collection('closed_days')
-      .orderBy('closedAt', descending: true)
-      .snapshots()
-      .map((s) => s.docs.map(ClosedDaySummary.fromDoc).toList());
+  Stream<List<ClosedDaySummary>> streamClosedDays() {
+    if (useCloud) {
+      return _db!
+          .collection('closed_days')
+          .orderBy('closedAt', descending: true)
+          .snapshots()
+          .map((s) => s.docs.map(ClosedDaySummary.fromDoc).toList());
+    }
+    Future.microtask(() => _closedDaysCtrl.add(List.from(_localClosedDays)));
+    return _closedDaysCtrl.stream;
+  }
 
-  Stream<List<AuditLog>> streamAuditLogs() => _db
-      .collection('audit_logs')
-      .orderBy('timestamp', descending: true)
-      .limit(100)
-      .snapshots()
-      .map((s) => s.docs.map(AuditLog.fromDoc).toList());
+  Stream<List<AuditLog>> streamAuditLogs() {
+    if (useCloud) {
+      return _db!
+          .collection('audit_logs')
+          .orderBy('timestamp', descending: true)
+          .limit(100)
+          .snapshots()
+          .map((s) => s.docs.map(AuditLog.fromDoc).toList());
+    }
+    Future.microtask(() => _logsCtrl.add(List.from(_localLogs)));
+    return _logsCtrl.stream;
+  }
 
   Future<void> startTableTimer(GamingTable table) async {
-    await _db.collection('tables').doc(table.id).update({
-      'status': 'running',
-      'lastStartTime': Timestamp.fromDate(DateTime.now()),
-    });
+    if (useCloud) {
+      await _db!.collection('tables').doc(table.id).update({
+        'status': 'running',
+        'lastStartTime': Timestamp.fromDate(DateTime.now()),
+      });
+    } else {
+      final idx = _localTables.indexWhere((t) => t.id == table.id);
+      if (idx >= 0) {
+        _localTables[idx] = GamingTable(
+          id: table.id,
+          name: table.name,
+          hourlyRate: table.hourlyRate,
+          status: 'running',
+          lastStartTime: DateTime.now(),
+          accumulatedSeconds: table.accumulatedSeconds,
+          attachedItems: table.attachedItems,
+        );
+        _saveAndEmitLocal();
+      }
+    }
     await _recordAudit(
       title: 'تنبيه ترابيزة: ${table.name}',
       message: 'تم تشغيل الوقت على ${table.name}',
@@ -524,11 +780,27 @@ class FirestoreService {
 
   Future<void> pauseTableTimer(GamingTable table) async {
     final totalElapsed = table.currentElapsedSeconds;
-    await _db.collection('tables').doc(table.id).update({
-      'status': 'paused',
-      'lastStartTime': null,
-      'accumulatedSeconds': totalElapsed,
-    });
+    if (useCloud) {
+      await _db!.collection('tables').doc(table.id).update({
+        'status': 'paused',
+        'lastStartTime': null,
+        'accumulatedSeconds': totalElapsed,
+      });
+    } else {
+      final idx = _localTables.indexWhere((t) => t.id == table.id);
+      if (idx >= 0) {
+        _localTables[idx] = GamingTable(
+          id: table.id,
+          name: table.name,
+          hourlyRate: table.hourlyRate,
+          status: 'paused',
+          lastStartTime: null,
+          accumulatedSeconds: totalElapsed,
+          attachedItems: table.attachedItems,
+        );
+        _saveAndEmitLocal();
+      }
+    }
     await _recordAudit(
       title: 'تنبيه ترابيزة: ${table.name}',
       message: 'تم إيقاف مؤقت لـ ${table.name}',
@@ -539,9 +811,25 @@ class FirestoreService {
 
   Future<void> updateTableHourlyRate(GamingTable table, double newRate) async {
     final oldRate = table.hourlyRate;
-    await _db.collection('tables').doc(table.id).update({
-      'hourlyRate': newRate,
-    });
+    if (useCloud) {
+      await _db!.collection('tables').doc(table.id).update({
+        'hourlyRate': newRate,
+      });
+    } else {
+      final idx = _localTables.indexWhere((t) => t.id == table.id);
+      if (idx >= 0) {
+        _localTables[idx] = GamingTable(
+          id: table.id,
+          name: table.name,
+          hourlyRate: newRate,
+          status: table.status,
+          lastStartTime: table.lastStartTime,
+          accumulatedSeconds: table.accumulatedSeconds,
+          attachedItems: table.attachedItems,
+        );
+        _saveAndEmitLocal();
+      }
+    }
     await _recordAudit(
       title: 'تنبيه تعديل سعر الساعة',
       message:
@@ -558,12 +846,25 @@ class FirestoreService {
     for (final entry in selectedDrinks.entries) {
       final item = entry.key;
       final qty = entry.value;
-
       final newStock = (item.stock - qty).clamp(0, 999999);
-      await _db
-          .collection('inventory')
-          .doc(item.id)
-          .update({'stock': newStock});
+
+      if (useCloud) {
+        await _db!
+            .collection('inventory')
+            .doc(item.id)
+            .update({'stock': newStock});
+      } else {
+        final iIdx = _localInv.indexWhere((i) => i.id == item.id);
+        if (iIdx >= 0) {
+          _localInv[iIdx] = InventoryItem(
+            id: item.id,
+            name: item.name,
+            price: item.price,
+            stock: newStock,
+            lowStockThreshold: item.lowStockThreshold,
+          );
+        }
+      }
 
       final existingIndex =
           updatedList.indexWhere((element) => element.itemId == item.id);
@@ -585,9 +886,25 @@ class FirestoreService {
       }
     }
 
-    await _db.collection('tables').doc(table.id).update({
-      'attachedItems': updatedList.map((e) => e.toMap()).toList(),
-    });
+    if (useCloud) {
+      await _db!.collection('tables').doc(table.id).update({
+        'attachedItems': updatedList.map((e) => e.toMap()).toList(),
+      });
+    } else {
+      final tIdx = _localTables.indexWhere((t) => t.id == table.id);
+      if (tIdx >= 0) {
+        _localTables[tIdx] = GamingTable(
+          id: table.id,
+          name: table.name,
+          hourlyRate: table.hourlyRate,
+          status: table.status,
+          lastStartTime: table.lastStartTime,
+          accumulatedSeconds: table.accumulatedSeconds,
+          attachedItems: updatedList,
+        );
+      }
+      _saveAndEmitLocal();
+    }
   }
 
   Future<SaleRecord> endAndCheckoutTable(GamingTable table) async {
@@ -597,7 +914,7 @@ class FirestoreService {
     final total = timeCost + drinksCost;
 
     final sale = SaleRecord(
-      id: '',
+      id: const Uuid().v4(),
       type: table.id == 'billiard' ? 'billiard_checkout' : 'pingpong_checkout',
       timeRevenue: timeCost,
       drinksRevenue: drinksCost,
@@ -608,14 +925,30 @@ class FirestoreService {
       isClosed: false,
     );
 
-    await _db.collection('sales').add(sale.toMap());
-
-    await _db.collection('tables').doc(table.id).update({
-      'status': 'idle',
-      'lastStartTime': null,
-      'accumulatedSeconds': 0,
-      'attachedItems': [],
-    });
+    if (useCloud) {
+      await _db!.collection('sales').add(sale.toMap());
+      await _db!.collection('tables').doc(table.id).update({
+        'status': 'idle',
+        'lastStartTime': null,
+        'accumulatedSeconds': 0,
+        'attachedItems': [],
+      });
+    } else {
+      _localSales.insert(0, sale);
+      final idx = _localTables.indexWhere((t) => t.id == table.id);
+      if (idx >= 0) {
+        _localTables[idx] = GamingTable(
+          id: table.id,
+          name: table.name,
+          hourlyRate: table.hourlyRate,
+          status: 'idle',
+          lastStartTime: null,
+          accumulatedSeconds: 0,
+          attachedItems: [],
+        );
+      }
+      _saveAndEmitLocal();
+    }
 
     await _recordAudit(
       title: 'حساب ترابيزة: ${table.name}',
@@ -645,14 +978,27 @@ class FirestoreService {
       ));
 
       final newStock = (item.stock - qty).clamp(0, 999999);
-      await _db
-          .collection('inventory')
-          .doc(item.id)
-          .update({'stock': newStock});
+      if (useCloud) {
+        await _db!
+            .collection('inventory')
+            .doc(item.id)
+            .update({'stock': newStock});
+      } else {
+        final idx = _localInv.indexWhere((i) => i.id == item.id);
+        if (idx >= 0) {
+          _localInv[idx] = InventoryItem(
+            id: item.id,
+            name: item.name,
+            price: item.price,
+            stock: newStock,
+            lowStockThreshold: item.lowStockThreshold,
+          );
+        }
+      }
     }
 
     final sale = SaleRecord(
-      id: '',
+      id: const Uuid().v4(),
       type: 'drinks_only',
       timeRevenue: 0,
       drinksRevenue: totalDrinks,
@@ -663,7 +1009,12 @@ class FirestoreService {
       isClosed: false,
     );
 
-    await _db.collection('sales').add(sale.toMap());
+    if (useCloud) {
+      await _db!.collection('sales').add(sale.toMap());
+    } else {
+      _localSales.insert(0, sale);
+      _saveAndEmitLocal();
+    }
   }
 
   Future<void> closeCurrentDayAndReset({
@@ -680,23 +1031,47 @@ class FirestoreService {
     double extraPingPong = 0;
     double extraDrinks = 0;
 
-    final tablesSnap = await _db.collection('tables').get();
-    for (final doc in tablesSnap.docs) {
-      final t = GamingTable.fromDoc(doc);
-      if (t.currentElapsedSeconds > 0 || t.attachedItems.isNotEmpty) {
-        if (t.id == 'billiard') {
-          extraBilliard += t.currentTimeCost;
-        } else {
-          extraPingPong += t.currentTimeCost;
-        }
-        extraDrinks += t.attachedDrinksCost;
+    if (useCloud) {
+      final tablesSnap = await _db!.collection('tables').get();
+      for (final doc in tablesSnap.docs) {
+        final t = GamingTable.fromDoc(doc);
+        if (t.currentElapsedSeconds > 0 || t.attachedItems.isNotEmpty) {
+          if (t.id == 'billiard') {
+            extraBilliard += t.currentTimeCost;
+          } else {
+            extraPingPong += t.currentTimeCost;
+          }
+          extraDrinks += t.attachedDrinksCost;
 
-        await doc.reference.update({
-          'status': 'idle',
-          'lastStartTime': null,
-          'accumulatedSeconds': 0,
-          'attachedItems': [],
-        });
+          await doc.reference.update({
+            'status': 'idle',
+            'lastStartTime': null,
+            'accumulatedSeconds': 0,
+            'attachedItems': [],
+          });
+        }
+      }
+    } else {
+      for (int i = 0; i < _localTables.length; i++) {
+        final t = _localTables[i];
+        if (t.currentElapsedSeconds > 0 || t.attachedItems.isNotEmpty) {
+          if (t.id == 'billiard') {
+            extraBilliard += t.currentTimeCost;
+          } else {
+            extraPingPong += t.currentTimeCost;
+          }
+          extraDrinks += t.attachedDrinksCost;
+
+          _localTables[i] = GamingTable(
+            id: t.id,
+            name: t.name,
+            hourlyRate: t.hourlyRate,
+            status: 'idle',
+            lastStartTime: null,
+            accumulatedSeconds: 0,
+            attachedItems: [],
+          );
+        }
       }
     }
 
@@ -705,25 +1080,34 @@ class FirestoreService {
     final finalPingPong = pingPongRev + extraPingPong;
     final finalGrandTotal = finalDrinks + finalBilliard + finalPingPong;
 
-    if (finalGrandTotal > 0) {
-      await _db.collection('closed_days').add(ClosedDaySummary(
-            id: '',
-            dateLabel: dateStr,
-            drinksRevenue: finalDrinks,
-            billiardRevenue: finalBilliard,
-            pingPongRevenue: finalPingPong,
-            grandTotal: finalGrandTotal,
-            closedAt: now,
-          ).toMap());
-    }
+    final summary = ClosedDaySummary(
+      id: const Uuid().v4(),
+      dateLabel: dateStr,
+      drinksRevenue: finalDrinks,
+      billiardRevenue: finalBilliard,
+      pingPongRevenue: finalPingPong,
+      grandTotal: finalGrandTotal,
+      closedAt: now,
+    );
 
-    final allSalesSnap = await _db.collection('sales').get();
-    for (final doc in allSalesSnap.docs) {
-      try {
-        await doc.reference.delete();
-      } catch (_) {
-        await doc.reference.update({'isClosed': true});
+    if (useCloud) {
+      if (finalGrandTotal > 0) {
+        await _db!.collection('closed_days').add(summary.toMap());
       }
+      final allSalesSnap = await _db!.collection('sales').get();
+      for (final doc in allSalesSnap.docs) {
+        try {
+          await doc.reference.delete();
+        } catch (_) {
+          await doc.reference.update({'isClosed': true});
+        }
+      }
+    } else {
+      if (finalGrandTotal > 0) {
+        _localClosedDays.insert(0, summary);
+      }
+      _localSales.clear();
+      _saveAndEmitLocal();
     }
 
     await _recordAudit(
@@ -741,12 +1125,23 @@ class FirestoreService {
     required int stock,
     required int threshold,
   }) async {
-    await _db.collection('inventory').add({
-      'name': name,
-      'price': price,
-      'stock': stock,
-      'lowStockThreshold': threshold,
-    });
+    if (useCloud) {
+      await _db!.collection('inventory').add({
+        'name': name,
+        'price': price,
+        'stock': stock,
+        'lowStockThreshold': threshold,
+      });
+    } else {
+      _localInv.add(InventoryItem(
+        id: const Uuid().v4(),
+        name: name,
+        price: price,
+        stock: stock,
+        lowStockThreshold: threshold,
+      ));
+      _saveAndEmitLocal();
+    }
     await _recordAudit(
       title: 'إضافة صنف جديد للمخزن',
       message: 'تم إضافة [$name] بسعر $price ج.م وكمية $stock',
@@ -757,7 +1152,24 @@ class FirestoreService {
 
   Future<void> updateItemPrice(InventoryItem item, double newPrice) async {
     final oldPrice = item.price;
-    await _db.collection('inventory').doc(item.id).update({'price': newPrice});
+    if (useCloud) {
+      await _db!
+          .collection('inventory')
+          .doc(item.id)
+          .update({'price': newPrice});
+    } else {
+      final idx = _localInv.indexWhere((i) => i.id == item.id);
+      if (idx >= 0) {
+        _localInv[idx] = InventoryItem(
+          id: item.id,
+          name: item.name,
+          price: newPrice,
+          stock: item.stock,
+          lowStockThreshold: item.lowStockThreshold,
+        );
+        _saveAndEmitLocal();
+      }
+    }
     await _recordAudit(
       title: 'تنبيه تعديل سعر',
       message:
@@ -769,7 +1181,24 @@ class FirestoreService {
 
   Future<void> updateItemStock(InventoryItem item, int newStock) async {
     final oldStock = item.stock;
-    await _db.collection('inventory').doc(item.id).update({'stock': newStock});
+    if (useCloud) {
+      await _db!
+          .collection('inventory')
+          .doc(item.id)
+          .update({'stock': newStock});
+    } else {
+      final idx = _localInv.indexWhere((i) => i.id == item.id);
+      if (idx >= 0) {
+        _localInv[idx] = InventoryItem(
+          id: item.id,
+          name: item.name,
+          price: item.price,
+          stock: newStock,
+          lowStockThreshold: item.lowStockThreshold,
+        );
+        _saveAndEmitLocal();
+      }
+    }
     await _recordAudit(
       title: 'تنبيه مخزن',
       message: 'تم تعديل كمية [${item.name}] من $oldStock إلى $newStock',
@@ -779,7 +1208,12 @@ class FirestoreService {
   }
 
   Future<void> deleteInventoryItem(InventoryItem item) async {
-    await _db.collection('inventory').doc(item.id).delete();
+    if (useCloud) {
+      await _db!.collection('inventory').doc(item.id).delete();
+    } else {
+      _localInv.removeWhere((i) => i.id == item.id);
+      _saveAndEmitLocal();
+    }
     await _recordAudit(
       title: 'حذف صنف من المخزن',
       message: 'تم حذف الصنف [${item.name}] نهائياً من المخزن',
@@ -937,13 +1371,17 @@ class ExportService {
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
+  bool firebaseReady = false;
   try {
     await Firebase.initializeApp();
-  } catch (_) {}
+    firebaseReady = true;
+  } catch (_) {
+    firebaseReady = false;
+  }
 
   await NotificationService().init();
   final firestoreService = FirestoreService();
-  await firestoreService.initAndSeed();
+  await firestoreService.initAndSeed(firebaseReady: firebaseReady);
 
   runApp(CafeAdminApp(firestoreService: firestoreService));
 }
@@ -957,6 +1395,7 @@ class CafeAdminApp extends StatelessWidget {
     final cairoTheme = GoogleFonts.cairoTextTheme(ThemeData.dark().textTheme);
 
     return MaterialApp(
+      scaffoldMessengerKey: rootScaffoldMessengerKey,
       debugShowCheckedModeBanner: false,
       title: 'Joker Cafe',
       locale: const Locale('ar', 'EG'),
@@ -1083,7 +1522,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                                   padding: const EdgeInsets.symmetric(
                                       horizontal: 12, vertical: 6),
                                   decoration: BoxDecoration(
-                                    color: Colors.teal.withOpacity(0.2),
+                                    color: Colors.teal.withValues(alpha: 0.2),
                                     borderRadius: BorderRadius.circular(12),
                                     border: Border.all(
                                         color: const Color(0xFF00C896)),
@@ -1197,4 +1636,991 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
               label: Text('الترابيزات والكاشير'),
             ),
             NavigationRailDestination(
-              icon: Icon(Icons.inventory
+              icon: Icon(Icons.inventory_2),
+              label: Text('إدارة المخزن والأسعار'),
+            ),
+            NavigationRailDestination(
+              icon: Icon(Icons.assessment),
+              label: Text('التقارير وتقفيل اليوم'),
+            ),
+            NavigationRailDestination(
+              icon: Icon(Icons.history),
+              label: Text('سجل التعديلات والإشعارات'),
+            ),
+          ],
+        ),
+        const VerticalDivider(width: 1),
+        Expanded(
+          child: Builder(
+            builder: (context) {
+              switch (desktopIndex) {
+                case 0:
+                  return Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Expanded(
+                        flex: 5,
+                        child: _buildTablesSection(tables, inventory),
+                      ),
+                      const VerticalDivider(width: 1),
+                      Expanded(
+                        flex: 5,
+                        child: _buildPosSection(inventory, tables),
+                      ),
+                    ],
+                  );
+                case 1:
+                  return _buildInventorySection(inventory, tables);
+                case 2:
+                  return _buildReportsSection(sales, logs);
+                case 3:
+                  return _buildAuditLogsSection(logs);
+                default:
+                  return const SizedBox.shrink();
+              }
+            },
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildAndroidMobileView(
+    List<GamingTable> tables,
+    List<InventoryItem> inventory,
+    List<SaleRecord> sales,
+    List<AuditLog> logs,
+  ) {
+    switch (_selectedIndex) {
+      case 0:
+        return _buildTablesSection(tables, inventory);
+      case 1:
+        return _buildPosSection(inventory, tables);
+      case 2:
+        return _buildInventorySection(inventory, tables);
+      case 3:
+        return _buildReportsSection(sales, logs);
+      case 4:
+        return _buildAuditLogsSection(logs);
+      default:
+        return _buildTablesSection(tables, inventory);
+    }
+  }
+
+  Widget _buildTablesSection(
+      List<GamingTable> tables, List<InventoryItem> inventory) {
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        const Text(
+          'إدارة الترابيزات - بلياردو وبينج بونج',
+          style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+        ),
+        const SizedBox(height: 12),
+        ...tables.map((table) => _buildTableCard(table, inventory)),
+      ],
+    );
+  }
+
+  Widget _buildTableCard(GamingTable table, List<InventoryItem> inventory) {
+    final isRunning = table.status == 'running';
+    final isPaused = table.status == 'paused';
+    final statusColor = isRunning
+        ? const Color(0xFF00C896)
+        : (isPaused ? Colors.orangeAccent : Colors.grey);
+
+    return Card(
+      margin: const EdgeInsets.only(bottom: 16),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(16),
+        side: BorderSide(color: statusColor.withValues(alpha: 0.6), width: 1.5),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Row(
+                  children: [
+                    Icon(
+                      table.id == 'billiard'
+                          ? Icons.lens_blur
+                          : Icons.sports_tennis,
+                      color: statusColor,
+                      size: 28,
+                    ),
+                    const SizedBox(width: 10),
+                    Text(
+                      table.name,
+                      style: const TextStyle(
+                          fontSize: 20, fontWeight: FontWeight.bold),
+                    ),
+                  ],
+                ),
+                ActionChip(
+                  avatar: const Icon(Icons.edit, size: 16),
+                  label: Text(
+                      'سعر الساعة: ${table.hourlyRate.toStringAsFixed(0)} ج.م'),
+                  onPressed: () => _showEditHourlyRateDialog(table),
+                ),
+              ],
+            ),
+            const Divider(height: 24),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceAround,
+              children: [
+                _metricColumn(
+                    'الوقت الفعلي', table.formattedDuration, statusColor),
+                _metricColumn(
+                    'حساب الوقت',
+                    '${table.currentTimeCost.toStringAsFixed(1)} ج.م',
+                    Colors.white),
+                _metricColumn(
+                    'حساب المشاريب',
+                    '${table.attachedDrinksCost.toStringAsFixed(1)} ج.م',
+                    Colors.amber),
+                _metricColumn(
+                    'إجمالي الترابيزة',
+                    '${table.grandTotal.toStringAsFixed(1)} ج.م',
+                    const Color(0xFF00C896)),
+              ],
+            ),
+            if (table.attachedItems.isNotEmpty) ...[
+              const SizedBox(height: 12),
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: Colors.black26,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Wrap(
+                  spacing: 8,
+                  children: table.attachedItems
+                      .map((item) => Chip(
+                            label: Text(
+                                '${item.name} × ${item.qty} (${item.total.toStringAsFixed(0)} ج.م)'),
+                          ))
+                      .toList(),
+                ),
+              ),
+            ],
+            const SizedBox(height: 16),
+            Wrap(
+              spacing: 10,
+              runSpacing: 10,
+              children: [
+                ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF00C896),
+                    foregroundColor: Colors.black,
+                  ),
+                  onPressed:
+                      isRunning ? null : () => widget.db.startTableTimer(table),
+                  icon: const Icon(Icons.play_arrow),
+                  label: const Text('ابدأ الوقت',
+                      style: TextStyle(fontWeight: FontWeight.bold)),
+                ),
+                ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.amber.shade700,
+                    foregroundColor: Colors.black,
+                  ),
+                  onPressed:
+                      isRunning ? () => widget.db.pauseTableTimer(table) : null,
+                  icon: const Icon(Icons.pause),
+                  label: const Text('إيقاف مؤقت',
+                      style: TextStyle(fontWeight: FontWeight.bold)),
+                ),
+                OutlinedButton.icon(
+                  onPressed: () => _showAttachDrinksDialog(table, inventory),
+                  icon: const Icon(Icons.local_cafe),
+                  label: const Text('إضافة مشاريب للترابيزة'),
+                ),
+                ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.redAccent,
+                    foregroundColor: Colors.white,
+                  ),
+                  onPressed: (table.currentElapsedSeconds > 0 ||
+                          table.attachedItems.isNotEmpty)
+                      ? () => _confirmTableCheckout(table)
+                      : null,
+                  icon: const Icon(Icons.receipt_long),
+                  label: const Text('إنهاء وحساب'),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _metricColumn(String label, String value, Color color) {
+    return Column(
+      children: [
+        Text(label,
+            style: const TextStyle(fontSize: 12, color: Colors.white70)),
+        const SizedBox(height: 4),
+        Text(
+          value,
+          style: TextStyle(
+              fontSize: 18, fontWeight: FontWeight.bold, color: color),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildPosSection(
+      List<InventoryItem> inventory, List<GamingTable> tables) {
+    double cartTotal = 0;
+    final Map<InventoryItem, int> resolvedCart = {};
+    for (final item in inventory) {
+      if (_posCart.containsKey(item.id) && _posCart[item.id]! > 0) {
+        final q = _posCart[item.id]!;
+        resolvedCart[item] = q;
+        cartTotal += item.price * q;
+      }
+    }
+
+    return Padding(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'الكاشير والمشاريب',
+            style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 12),
+          Expanded(
+            child: GridView.builder(
+              gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+                maxCrossAxisExtent: 190,
+                mainAxisSpacing: 12,
+                crossAxisSpacing: 12,
+                childAspectRatio: 1.05,
+              ),
+              itemCount: inventory.length,
+              itemBuilder: (context, index) {
+                final item = inventory[index];
+                final qtyInCart = _posCart[item.id] ?? 0;
+
+                return InkWell(
+                  onTap: item.stock > qtyInCart
+                      ? () => setState(() => _posCart[item.id] = qtyInCart + 1)
+                      : null,
+                  borderRadius: BorderRadius.circular(14),
+                  child: Card(
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14),
+                      side: BorderSide(
+                        color: qtyInCart > 0
+                            ? const Color(0xFF00C896)
+                            : Colors.white12,
+                        width: qtyInCart > 0 ? 2 : 1,
+                      ),
+                    ),
+                    child: Padding(
+                      padding: const EdgeInsets.all(12),
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Text(
+                            'المتاح: ${item.stock}',
+                            style: const TextStyle(
+                                fontSize: 11, color: Colors.white60),
+                          ),
+                          Text(
+                            item.name,
+                            style: const TextStyle(
+                                fontSize: 17, fontWeight: FontWeight.bold),
+                            textAlign: TextAlign.center,
+                          ),
+                          Text(
+                            '${item.price.toStringAsFixed(1)} ج.م',
+                            style: const TextStyle(
+                                color: Color(0xFF00C896),
+                                fontWeight: FontWeight.bold),
+                          ),
+                          if (qtyInCart > 0)
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                IconButton(
+                                  icon: const Icon(Icons.remove_circle_outline,
+                                      size: 20),
+                                  onPressed: () => setState(() {
+                                    if (qtyInCart <= 1) {
+                                      _posCart.remove(item.id);
+                                    } else {
+                                      _posCart[item.id] = qtyInCart - 1;
+                                    }
+                                  }),
+                                ),
+                                Text('$qtyInCart',
+                                    style: const TextStyle(
+                                        fontWeight: FontWeight.bold)),
+                                IconButton(
+                                  icon: const Icon(Icons.add_circle_outline,
+                                      size: 20),
+                                  onPressed: item.stock > qtyInCart
+                                      ? () => setState(() =>
+                                          _posCart[item.id] = qtyInCart + 1)
+                                      : null,
+                                ),
+                              ],
+                            ),
+                        ],
+                      ),
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+          if (resolvedCart.isNotEmpty)
+            Container(
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                color: const Color(0xFF181E2C),
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(color: const Color(0xFF00C896)),
+              ),
+              child: Column(
+                children: [
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Text(
+                        'الإجمالي: ${cartTotal.toStringAsFixed(1)} ج.م',
+                        style: const TextStyle(
+                            fontSize: 17, fontWeight: FontWeight.bold),
+                      ),
+                      TextButton(
+                        onPressed: () => setState(() => _posCart.clear()),
+                        child: const Text('إلغاء',
+                            style: TextStyle(color: Colors.redAccent)),
+                      ),
+                    ],
+                  ),
+                  Wrap(
+                    spacing: 10,
+                    runSpacing: 10,
+                    children: [
+                      ElevatedButton.icon(
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFF00C896),
+                          foregroundColor: Colors.black,
+                        ),
+                        onPressed: () async {
+                          await widget.db.checkoutDirectPos(resolvedCart);
+                          setState(() => _posCart.clear());
+                        },
+                        icon: const Icon(Icons.check_circle),
+                        label: const Text('تأكيد الطلب (كاشير)'),
+                      ),
+                      ...tables.map((t) => OutlinedButton(
+                            onPressed: () async {
+                              await widget.db
+                                  .attachDrinksToTable(t, resolvedCart);
+                              setState(() => _posCart.clear());
+                            },
+                            child: Text('إضافة لـ ${t.name}'),
+                          )),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildInventorySection(
+      List<InventoryItem> inventory, List<GamingTable> tables) {
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            const Text(
+              'إدارة المخزن وتعديل الأسعار',
+              style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+            ),
+            ElevatedButton.icon(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF00C896),
+                foregroundColor: Colors.black,
+              ),
+              onPressed: _showAddInventoryDialog,
+              icon: const Icon(Icons.add),
+              label: const Text('إضافة صنف'),
+            ),
+          ],
+        ),
+        const SizedBox(height: 16),
+        ...inventory.map((item) => Card(
+              margin: const EdgeInsets.only(bottom: 10),
+              child: ListTile(
+                title: Text(item.name,
+                    style: const TextStyle(fontWeight: FontWeight.bold)),
+                subtitle: Text(
+                    'السعر: ${item.price.toStringAsFixed(1)} ج.م | المخزن: ${item.stock}'),
+                trailing: Wrap(
+                  spacing: 8,
+                  children: [
+                    OutlinedButton(
+                      onPressed: () => _showEditPriceDialog(item),
+                      child: const Text('السعر'),
+                    ),
+                    OutlinedButton(
+                      onPressed: () => _showEditStockDialog(item),
+                      child: const Text('الكمية'),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.delete_outline,
+                          color: Colors.redAccent),
+                      onPressed: () => widget.db.deleteInventoryItem(item),
+                    ),
+                  ],
+                ),
+              ),
+            )),
+      ],
+    );
+  }
+
+  Widget _buildReportsSection(List<SaleRecord> sales, List<AuditLog> logs) {
+    double drinksRev = 0;
+    double billiardRev = 0;
+    double pingPongRev = 0;
+    int billiardSeconds = 0;
+    int pingPongSeconds = 0;
+    final Map<String, int> itemBreakdown = {};
+
+    for (final s in sales) {
+      drinksRev += s.drinksRevenue;
+      if (s.type == 'billiard_checkout') {
+        billiardRev += s.timeRevenue;
+        billiardSeconds += s.playedSeconds;
+      } else if (s.type == 'pingpong_checkout') {
+        pingPongRev += s.timeRevenue;
+        pingPongSeconds += s.playedSeconds;
+      }
+      for (final item in s.soldItems) {
+        itemBreakdown[item.name] = (itemBreakdown[item.name] ?? 0) + item.qty;
+      }
+    }
+
+    final grandTotal = drinksRev + billiardRev + pingPongRev;
+
+    return StreamBuilder<List<ClosedDaySummary>>(
+      stream: widget.db.streamClosedDays(),
+      builder: (context, closedSnap) {
+        final closedDays = closedSnap.data ?? [];
+
+        ClosedDaySummary? highestDay;
+        for (final d in closedDays) {
+          if (highestDay == null || d.grandTotal > highestDay.grandTotal) {
+            highestDay = d;
+          }
+        }
+
+        return ListView(
+          padding: const EdgeInsets.all(16),
+          children: [
+            if (highestDay != null)
+              Card(
+                color: const Color(0xFF1D2331),
+                margin: const EdgeInsets.only(bottom: 16),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14),
+                  side: const BorderSide(color: Colors.pinkAccent, width: 1),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    children: [
+                      const Text('أعلى يوم',
+                          style:
+                              TextStyle(fontSize: 14, color: Colors.white70)),
+                      const SizedBox(height: 6),
+                      Text(
+                        highestDay.dateLabel,
+                        style: const TextStyle(
+                          fontSize: 22,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.pinkAccent,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        '${highestDay.grandTotal.toStringAsFixed(1)} ج.م',
+                        style: const TextStyle(
+                            fontSize: 16, color: Color(0xFF00C896)),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              decoration: BoxDecoration(
+                color: const Color(0xFF1D2331),
+                borderRadius: BorderRadius.circular(14),
+              ),
+              child: Wrap(
+                spacing: 12,
+                runSpacing: 10,
+                alignment: WrapAlignment.spaceBetween,
+                crossAxisAlignment: WrapCrossAlignment.center,
+                children: [
+                  ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF00C853),
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 24, vertical: 12),
+                      shape: const StadiumBorder(),
+                    ),
+                    onPressed: () => _confirmCloseDayDialog(
+                      drinksRev: drinksRev,
+                      billiardRev: billiardRev,
+                      pingPongRev: pingPongRev,
+                      grandTotal: grandTotal,
+                    ),
+                    icon: const Icon(Icons.lock_clock),
+                    label: const Text(
+                      'تقفيل اليوم',
+                      style:
+                          TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                  Wrap(
+                    spacing: 8,
+                    children: [
+                      OutlinedButton.icon(
+                        onPressed: () => ExportService.exportDailyPdfReport(
+                          sales: sales,
+                          logs: logs,
+                          drinksRev: drinksRev,
+                          billiardRev: billiardRev,
+                          pingPongRev: pingPongRev,
+                          grandTotal: grandTotal,
+                          itemBreakdown: itemBreakdown,
+                        ),
+                        icon: const Icon(Icons.picture_as_pdf),
+                        label: const Text('PDF'),
+                      ),
+                      OutlinedButton.icon(
+                        onPressed: () async {
+                          final msg = await ExportService.exportExcelReport(
+                            sales: sales,
+                            logs: logs,
+                            drinksRev: drinksRev,
+                            billiardRev: billiardRev,
+                            pingPongRev: pingPongRev,
+                            grandTotal: grandTotal,
+                            itemBreakdown: itemBreakdown,
+                          );
+                          if (mounted) {
+                            ScaffoldMessenger.of(context)
+                                .showSnackBar(SnackBar(content: Text(msg)));
+                          }
+                        },
+                        icon: const Icon(Icons.table_view),
+                        label: const Text('إكسيل'),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 16),
+            Wrap(
+              spacing: 12,
+              runSpacing: 12,
+              children: [
+                _summaryReportCard(
+                    'إيراد المشاريب الحالي', drinksRev, Colors.amber),
+                _summaryReportCard(
+                    'البلياردو (${(billiardSeconds / 3600).toStringAsFixed(1)} س)',
+                    billiardRev,
+                    Colors.cyanAccent),
+                _summaryReportCard(
+                    'البينج بونج (${(pingPongSeconds / 3600).toStringAsFixed(1)} س)',
+                    pingPongRev,
+                    Colors.purpleAccent),
+                _summaryReportCard('إجمالي الشيفت الحالي', grandTotal,
+                    const Color(0xFF00C896)),
+              ],
+            ),
+            const SizedBox(height: 24),
+            const Text('سجل الأيام المتقفلة السابقة:',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 10),
+            if (closedDays.isEmpty)
+              const Text('مفيش أيام اتقفلت لسه.')
+            else
+              ...closedDays.map((day) => Card(
+                    color: const Color(0xFF1D2331),
+                    margin: const EdgeInsets.only(bottom: 8),
+                    child: ListTile(
+                      title: Text(
+                        day.dateLabel,
+                        style: const TextStyle(fontWeight: FontWeight.bold),
+                      ),
+                      subtitle: Text(
+                        'مشاريب: ${day.drinksRevenue.toStringAsFixed(0)} | بلياردو: ${day.billiardRevenue.toStringAsFixed(0)} | بينج: ${day.pingPongRevenue.toStringAsFixed(0)}',
+                        style: const TextStyle(fontSize: 12),
+                      ),
+                      trailing: Text(
+                        '${day.grandTotal.toStringAsFixed(1)} ج.م',
+                        style: const TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.bold,
+                          color: Color(0xFF00C896),
+                        ),
+                      ),
+                    ),
+                  )),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _summaryReportCard(String title, double amount, Color accent) {
+    return SizedBox(
+      width: 220,
+      child: Card(
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+          side: BorderSide(color: accent.withValues(alpha: 0.6)),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(title,
+                  style: const TextStyle(fontSize: 13, color: Colors.white70)),
+              const SizedBox(height: 8),
+              Text(
+                '${amount.toStringAsFixed(2)} ج.م',
+                style: TextStyle(
+                    fontSize: 20, fontWeight: FontWeight.bold, color: accent),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildAuditLogsSection(List<AuditLog> logs) {
+    return ListView.builder(
+      padding: const EdgeInsets.all(16),
+      itemCount: logs.length,
+      itemBuilder: (context, index) {
+        final log = logs[index];
+        return Card(
+          margin: const EdgeInsets.only(bottom: 8),
+          child: ListTile(
+            leading: const Icon(Icons.notifications_active,
+                color: Colors.amberAccent),
+            title: Text(log.title,
+                style: const TextStyle(fontWeight: FontWeight.bold)),
+            subtitle: Text(
+                '${log.message}\nقبل: ${log.beforeVal} ⬅ بعد: ${log.afterVal}'),
+            trailing: Text(
+              intl.DateFormat('hh:mm a').format(log.timestamp),
+              style: const TextStyle(fontSize: 12, color: Colors.white54),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  void _confirmCloseDayDialog({
+    required double drinksRev,
+    required double billiardRev,
+    required double pingPongRev,
+    required double grandTotal,
+  }) {
+    showDialog(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('تأكيد تقفيل اليوم وتصفير الشيفت'),
+        content: Text(
+          'هيتم ترحيل حسابات الشيفت الحالي (${grandTotal.toStringAsFixed(1)} ج.م) بالإضافة لأي ترابيزة مفتوحة، وتصفير العدادات بالكامل ليوم جديد.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('إلغاء'),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFF00C853),
+              foregroundColor: Colors.white,
+            ),
+            onPressed: () async {
+              Navigator.pop(dialogContext);
+              await widget.db.closeCurrentDayAndReset(
+                drinksRev: drinksRev,
+                billiardRev: billiardRev,
+                pingPongRev: pingPongRev,
+                grandTotal: grandTotal,
+              );
+              if (mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text(
+                        'تم تقفيل اليوم وتصفير جميع الحسابات والترابيزات!'),
+                  ),
+                );
+              }
+            },
+            child: const Text('نعم، قفّل وصفر الآن'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showEditHourlyRateDialog(GamingTable table) {
+    final ctrl =
+        TextEditingController(text: table.hourlyRate.toStringAsFixed(0));
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: Text('تعديل سعر الساعة - ${table.name}'),
+        content: TextField(
+          controller: ctrl,
+          keyboardType: TextInputType.number,
+          decoration: const InputDecoration(labelText: 'سعر الساعة (ج.م)'),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('إلغاء')),
+          ElevatedButton(
+            onPressed: () {
+              final val = double.tryParse(ctrl.text);
+              if (val != null && val > 0) {
+                widget.db.updateTableHourlyRate(table, val);
+                Navigator.pop(context);
+              }
+            },
+            child: const Text('حفظ'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showAttachDrinksDialog(
+      GamingTable table, List<InventoryItem> inventory) {
+    final Map<InventoryItem, int> tempSelection = {};
+    showDialog(
+      context: context,
+      builder: (_) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: Text('إضافة مشاريب لـ ${table.name}'),
+          content: SizedBox(
+            width: 400,
+            height: 320,
+            child: ListView(
+              children: inventory.map((item) {
+                final count = tempSelection[item] ?? 0;
+                return ListTile(
+                  title: Text('${item.name} (${item.price} ج.م)'),
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      IconButton(
+                        icon: const Icon(Icons.remove),
+                        onPressed: count > 0
+                            ? () => setDialogState(
+                                () => tempSelection[item] = count - 1)
+                            : null,
+                      ),
+                      Text('$count'),
+                      IconButton(
+                        icon: const Icon(Icons.add),
+                        onPressed: item.stock > count
+                            ? () => setDialogState(
+                                () => tempSelection[item] = count + 1)
+                            : null,
+                      ),
+                    ],
+                  ),
+                );
+              }).toList(),
+            ),
+          ),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('إلغاء')),
+            ElevatedButton(
+              onPressed: () {
+                tempSelection.removeWhere((_, v) => v <= 0);
+                if (tempSelection.isNotEmpty) {
+                  widget.db.attachDrinksToTable(table, tempSelection);
+                }
+                Navigator.pop(context);
+              },
+              child: const Text('إضافة'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _confirmTableCheckout(GamingTable table) {
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: Text('حساب الترابيزة - ${table.name}'),
+        content: Text(
+          'الإجمالي المطلوب دفعه: ${table.grandTotal.toStringAsFixed(2)} ج.م',
+          style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('رجوع')),
+          ElevatedButton(
+            onPressed: () async {
+              await widget.db.endAndCheckoutTable(table);
+              if (mounted) Navigator.pop(context);
+            },
+            child: const Text('تأكيد التحصيل وتصفير الترابيزة'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showAddInventoryDialog() {
+    final nameCtrl = TextEditingController();
+    final priceCtrl = TextEditingController();
+    final stockCtrl = TextEditingController();
+
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('إضافة صنف جديد'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: nameCtrl,
+              decoration: const InputDecoration(labelText: 'اسم الصنف'),
+            ),
+            TextField(
+              controller: priceCtrl,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(labelText: 'السعر (ج.م)'),
+            ),
+            TextField(
+              controller: stockCtrl,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(labelText: 'الكمية بالمخزن'),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('إلغاء')),
+          ElevatedButton(
+            onPressed: () {
+              final name = nameCtrl.text.trim();
+              final price = double.tryParse(priceCtrl.text) ?? 0;
+              final stock = int.tryParse(stockCtrl.text) ?? 0;
+              if (name.isNotEmpty && price > 0) {
+                widget.db.addNewInventoryItem(
+                  name: name,
+                  price: price,
+                  stock: stock,
+                  threshold: 10,
+                );
+                Navigator.pop(context);
+              }
+            },
+            child: const Text('إضافة'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showEditPriceDialog(InventoryItem item) {
+    final ctrl = TextEditingController(text: item.price.toStringAsFixed(1));
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: Text('تعديل سعر: ${item.name}'),
+        content: TextField(
+          controller: ctrl,
+          keyboardType: TextInputType.number,
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('إلغاء')),
+          ElevatedButton(
+            onPressed: () {
+              final val = double.tryParse(ctrl.text);
+              if (val != null && val > 0) {
+                widget.db.updateItemPrice(item, val);
+                Navigator.pop(context);
+              }
+            },
+            child: const Text('حفظ'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showEditStockDialog(InventoryItem item) {
+    final ctrl = TextEditingController(text: item.stock.toString());
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: Text('تعديل الكمية: ${item.name}'),
+        content: TextField(
+          controller: ctrl,
+          keyboardType: TextInputType.number,
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('إلغاء')),
+          ElevatedButton(
+            onPressed: () {
+              final val = int.tryParse(ctrl.text);
+              if (val != null && val >= 0) {
+                widget.db.updateItemStock(item, val);
+                Navigator.pop(context);
+              }
+            },
+            child: const Text('حفظ'),
+          ),
+        ],
+      ),
+    );
+  }
+}
