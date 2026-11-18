@@ -1668,4 +1668,222 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
         ...inventory.map((item) => Card(
               child: ListTile(
                 title: Text(item.name, style: const TextStyle(fontWeight: FontWeight.bold)),
-                subtitle: Text('السعر
+                subtitle: Text('السعر: ${item.price} ج.م | المخزن: ${item.stock}'),
+              ),
+            )),
+      ],
+    );
+  }
+
+  Widget _buildReportsSection(List<SaleRecord> sales, List<AuditLog> logs) {
+    double drinksRev = 0;
+    double tableRev = 0;
+    for (final s in sales) {
+      drinksRev += s.drinksRevenue;
+      tableRev += s.timeRevenue;
+    }
+    final grandTotal = drinksRev + tableRev;
+
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        ElevatedButton(
+          style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
+          onPressed: () => _confirmCloseDayDialog(drinksRev, tableRev, grandTotal),
+          child: const Text('تقفيل اليوم وتصفير الشيفت', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+        ),
+        const SizedBox(height: 16),
+        Text('إيراد المشاريب: ${drinksRev.toStringAsFixed(1)} ج.م'),
+        Text('إيراد الترابيزات: ${tableRev.toStringAsFixed(1)} ج.م'),
+        Text('الإجمالي: ${grandTotal.toStringAsFixed(1)} ج.م', style: const TextStyle(color: Color(0xFF00C896), fontWeight: FontWeight.bold)),
+      ],
+    );
+  }
+
+  Widget _buildAuditLogsSection(List<AuditLog> logs) {
+    return ListView.builder(
+      padding: const EdgeInsets.all(16),
+      itemCount: logs.length,
+      itemBuilder: (context, index) {
+        final log = logs[index];
+        return Card(
+          child: ListTile(
+            title: Text(log.title),
+            subtitle: Text(log.message),
+          ),
+        );
+      },
+    );
+  }
+
+  void _showAddTableDialog() {
+    final nameCtrl = TextEditingController();
+    final rateCtrl = TextEditingController(text: '0');
+    String typeVal = 'normal';
+
+    showDialog(
+      context: context,
+      builder: (_) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: const Text('إضافة ترابيزة جديدة'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(controller: nameCtrl, decoration: const InputDecoration(labelText: 'اسم الترابيزة')),
+              DropdownButtonFormField<String>(
+                value: typeVal,
+                items: const [
+                  DropdownMenuItem(value: 'normal', child: Text('ترابيزة عادية (قعدات)')),
+                  DropdownMenuItem(value: 'gaming', child: Text('ترابيزة ألعاب (بساعة)')),
+                ],
+                onChanged: (val) => setDialogState(() => typeVal = val ?? 'normal'),
+              ),
+              if (typeVal == 'gaming')
+                TextField(controller: rateCtrl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'سعر الساعة')),
+            ],
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(context), child: const Text('إلغاء')),
+            ElevatedButton(
+              onPressed: () {
+                final name = nameCtrl.text.trim();
+                final rate = double.tryParse(rateCtrl.text) ?? 0;
+                if (name.isNotEmpty) {
+                  widget.db.addNewTable(name: name, type: typeVal, hourlyRate: rate);
+                  Navigator.pop(context);
+                }
+              },
+              child: const Text('إضافة'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showAttachDrinksDialog(GamingTable table, List<InventoryItem> inventory) {
+    final Map<InventoryItem, int> tempSelection = {};
+    showDialog(
+      context: context,
+      builder: (_) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: Text('إضافة مشاريب (Hold) لـ ${table.name}'),
+          content: SizedBox(
+            width: 400,
+            height: 300,
+            child: ListView(
+              children: inventory.map((item) {
+                final count = tempSelection[item] ?? 0;
+                return ListTile(
+                  title: Text('${item.name} (${item.price} ج.م)'),
+                  trailing: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      IconButton(
+                        icon: const Icon(Icons.remove),
+                        onPressed: count > 0 ? () => setDialogState(() => tempSelection[item] = count - 1) : null,
+                      ),
+                      Text('$count'),
+                      IconButton(
+                        icon: const Icon(Icons.add),
+                        onPressed: item.stock > count ? () => setDialogState(() => tempSelection[item] = count + 1) : null,
+                      ),
+                    ],
+                  ),
+                );
+              }).toList(),
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(context), child: const Text('إلغاء')),
+            ElevatedButton(
+              onPressed: () {
+                tempSelection.removeWhere((_, v) => v <= 0);
+                if (tempSelection.isNotEmpty) {
+                  widget.db.attachDrinksToTable(table, tempSelection);
+                }
+                Navigator.pop(context);
+              },
+              child: const Text('تأكيد (تفضيل Hold)'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _confirmTableCheckout(GamingTable table) {
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: Text('حساب الترابيزة - ${table.name}'),
+        content: Text('الإجمالي المطلوب: ${table.grandTotal.toStringAsFixed(2)} ج.م', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('رجوع')),
+          ElevatedButton(
+            onPressed: () async {
+              await widget.db.endAndCheckoutTable(table);
+              if (mounted) Navigator.pop(context);
+            },
+            child: const Text('تأكيد التحصيل وتصفير الترابيزة'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _confirmCloseDayDialog(double dRev, double tRev, double gTotal) {
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('تقفيل اليوم'),
+        content: Text('هل تريد تقفيل اليوم بإجمالي ${gTotal.toStringAsFixed(1)} ج.م وتصفير الشيفت؟'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('إلغاء')),
+          ElevatedButton(
+            onPressed: () async {
+              await widget.db.closeCurrentDayAndReset(drinksRev: dRev, tableRev: tRev, grandTotal: gTotal);
+              if (mounted) Navigator.pop(context);
+            },
+            child: const Text('نعم، قفّل'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showAddInventoryDialog() {
+    final nameCtrl = TextEditingController();
+    final priceCtrl = TextEditingController();
+    final stockCtrl = TextEditingController();
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: const Text('إضافة صنف'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(controller: nameCtrl, decoration: const InputDecoration(labelText: 'اسم الصنف')),
+            TextField(controller: priceCtrl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'السعر')),
+            TextField(controller: stockCtrl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'الكمية')),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('إلغاء')),
+          ElevatedButton(
+            onPressed: () {
+              final name = nameCtrl.text.trim();
+              final price = double.tryParse(priceCtrl.text) ?? 0;
+              final stock = int.tryParse(stockCtrl.text) ?? 0;
+              if (name.isNotEmpty && price > 0) {
+                widget.db.addNewInventoryItem(name: name, price: price, stock: stock, threshold: 5);
+                Navigator.pop(context);
+              }
+            },
+            child: const Text('إضافة'),
+          ),
+        ],
+      ),
+    );
+  }
+}
