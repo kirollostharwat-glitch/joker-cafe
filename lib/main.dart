@@ -486,7 +486,6 @@ class FirestoreService {
   }
 
   void _listenToCloudRealtimeStreams() {
-    // تفعيل الـ Streams الحية بين الأجهزة لحظياً عبر الفايربيس
     _db!.collection('tables').snapshots().listen((snapshot) {
       final list = snapshot.docs.map(GamingTable.fromDoc).toList();
       _tablesCtrl.add(list);
@@ -758,6 +757,49 @@ class FirestoreService {
     );
   }
 
+  // حذف الترابيزة نهائياً
+  Future<void> deleteTable(GamingTable table) async {
+    if (useCloud) {
+      await _db!.collection('tables').doc(table.id).delete();
+    } else {
+      _localTables.removeWhere((t) => t.id == table.id);
+      _saveAndEmitLocal();
+    }
+    await _recordAudit(
+      title: 'حذف ترابيزة',
+      message: 'تم حذف الترابيزة [${table.name}] نهائياً',
+      beforeVal: 'موجودة',
+      afterVal: 'محذوفة',
+    );
+  }
+
+  // تعديل بيانات الترابيزة (الاسم، النوع، سعر الساعة)
+  Future<void> updateTableDetails(GamingTable table, String newName, String newType, double newRate) async {
+    if (useCloud) {
+      await _db!.collection('tables').doc(table.id).update({
+        'name': newName,
+        'type': newType,
+        'hourlyRate': newRate,
+      });
+    } else {
+      final idx = _localTables.indexWhere((t) => t.id == table.id);
+      if (idx >= 0) {
+        _localTables[idx] = GamingTable(
+          id: table.id,
+          name: newName,
+          hourlyRate: newRate,
+          type: newType,
+          status: table.status,
+          lastStartTime: table.lastStartTime,
+          accumulatedSeconds: table.accumulatedSeconds,
+          attachedItems: table.attachedItems,
+          guestNotes: table.guestNotes,
+        );
+        _saveAndEmitLocal();
+      }
+    }
+  }
+
   Future<void> startTableTimer(GamingTable table) async {
     if (table.type == 'normal') return;
     if (useCloud) {
@@ -836,7 +878,6 @@ class FirestoreService {
     }
   }
 
-  // تحديث الطلبات والمشاريب بالكامل (تعديل، زيادة، حذف) للترابيزة المفتوحة Hold
   Future<void> updateTableAttachedItems(GamingTable table, List<AttachedItem> newItems) async {
     if (useCloud) {
       await _db!.collection('tables').doc(table.id).update({
@@ -1483,9 +1524,26 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                     Text(table.name, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
                   ],
                 ),
-                Chip(
-                  label: Text(isNormal ? 'ترابيزة عادية (قعدة)' : 'ساعة: ${table.hourlyRate.toStringAsFixed(0)} ج.م'),
-                  backgroundColor: statusColor.withValues(alpha: 0.2),
+                Row(
+                  children: [
+                    Chip(
+                      label: Text(isNormal ? 'ترابيزة عادية' : 'ساعة: ${table.hourlyRate.toStringAsFixed(0)} ج.م'),
+                      backgroundColor: statusColor.withValues(alpha: 0.2),
+                    ),
+                    const SizedBox(width: 6),
+                    // زر تعديل الترابيزة
+                    IconButton(
+                      icon: const Icon(Icons.edit, size: 20, color: Colors.blueAccent),
+                      tooltip: 'تعديل بيانات الترابيزة',
+                      onPressed: () => _showEditTableDialog(table),
+                    ),
+                    // زر حذف الترابيزة
+                    IconButton(
+                      icon: const Icon(Icons.delete_outline, size: 20, color: Colors.redAccent),
+                      tooltip: 'حذف الترابيزة',
+                      onPressed: () => _confirmDeleteTable(table),
+                    ),
+                  ],
                 ),
               ],
             ),
@@ -1782,6 +1840,74 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  // نافذة تعديل بيانات الترابيزة (الاسم، النوع، سعر الساعة)
+  void _showEditTableDialog(GamingTable table) {
+    final nameCtrl = TextEditingController(text: table.name);
+    final rateCtrl = TextEditingController(text: table.hourlyRate.toStringAsFixed(0));
+    String typeVal = table.type;
+
+    showDialog(
+      context: context,
+      builder: (_) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: Text('تعديل بيانات: ${table.name}'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(controller: nameCtrl, decoration: const InputDecoration(labelText: 'اسم الترابيزة')),
+              DropdownButtonFormField<String>(
+                value: typeVal,
+                items: const [
+                  DropdownMenuItem(value: 'normal', child: Text('ترابيزة عادية (قعدات)')),
+                  DropdownMenuItem(value: 'gaming', child: Text('ترابيزة ألعاب (بساعة)')),
+                ],
+                onChanged: (val) => setDialogState(() => typeVal = val ?? 'normal'),
+              ),
+              if (typeVal == 'gaming')
+                TextField(controller: rateCtrl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'سعر الساعة')),
+            ],
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(context), child: const Text('إلغاء')),
+            ElevatedButton(
+              onPressed: () {
+                final name = nameCtrl.text.trim();
+                final rate = double.tryParse(rateCtrl.text) ?? 0;
+                if (name.isNotEmpty) {
+                  widget.db.updateTableDetails(table, name, typeVal, rate);
+                  Navigator.pop(context);
+                }
+              },
+              child: const Text('حفظ التعديل'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // تأكيد حذف الترابيزة
+  void _confirmDeleteTable(GamingTable table) {
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: Text('حذف الترابيزة: ${table.name}'),
+        content: const Text('هل أنت متأكد من حذف هذه الترابيزة نهائياً؟'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text('إلغاء')),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
+            onPressed: () async {
+              await widget.db.deleteTable(table);
+              if (mounted) Navigator.pop(context);
+            },
+            child: const Text('نعم، حذف'),
+          ),
+        ],
       ),
     );
   }
