@@ -8,6 +8,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:intl/intl.dart' as intl;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 
@@ -17,14 +18,15 @@ final GlobalKey<ScaffoldMessengerState> rootScaffoldMessengerKey =
 // =============================================================================
 // 0. APP VERSION & REMOTE OTA UPDATE CONFIG (التحديث عن بُعد من جيت هاب)
 // =============================================================================
-const String kCurrentAppVersion = '1.0.0';
+const String kCurrentAppVersion = '1.0.1';
 const String kRemoteVersionJsonUrl =
     'https://raw.githubusercontent.com/kirollostharwat-glitch/joker-cafe/main/version.json';
 
 class AppUpdateService {
   static Future?> checkForUpdate() async {
     try {
-      final client = HttpClient()..connectionTimeout = const Duration(seconds: 5);
+      final client = HttpClient()
+        ..connectionTimeout = const Duration(seconds: 5);
       final req = await client.getUrl(Uri.parse(kRemoteVersionJsonUrl));
       final res = await req.close();
       if (res.statusCode == 200) {
@@ -44,7 +46,8 @@ class AppUpdateService {
       if (Platform.isWindows) {
         await Process.run('cmd', ['/c', 'start', '', url]);
       } else if (Platform.isAndroid) {
-        await Process.run('am', ['start', '-a', 'android.intent.action.VIEW', '-d', url]);
+        await Process.run(
+            'am', ['start', '-a', 'android.intent.action.VIEW', '-d', url]);
       }
     } catch (_) {}
   }
@@ -1097,6 +1100,32 @@ class FirestoreService {
 
   Future<void> updateTableAttachedItems(
       GamingTable table, List<AttachedItem> newItems) async {
+    // حساب فرق المخزن عند تعديل طلبات الترابيزة
+    for (final oldItem in table.attachedItems) {
+      final iIdx = _localInv.indexWhere((i) => i.id == oldItem.itemId);
+      if (iIdx >= 0) {
+        _localInv[iIdx] = InventoryItem(
+          id: _localInv[iIdx].id,
+          name: _localInv[iIdx].name,
+          price: _localInv[iIdx].price,
+          stock: _localInv[iIdx].stock + oldItem.qty,
+          lowStockThreshold: _localInv[iIdx].lowStockThreshold,
+        );
+      }
+    }
+    for (final newItem in newItems) {
+      final iIdx = _localInv.indexWhere((i) => i.id == newItem.itemId);
+      if (iIdx >= 0) {
+        _localInv[iIdx] = InventoryItem(
+          id: _localInv[iIdx].id,
+          name: _localInv[iIdx].name,
+          price: _localInv[iIdx].price,
+          stock: (_localInv[iIdx].stock - newItem.qty).clamp(0, 999999),
+          lowStockThreshold: _localInv[iIdx].lowStockThreshold,
+        );
+      }
+    }
+
     final idx = _localTables.indexWhere((t) => t.id == table.id);
     if (idx >= 0) {
       _localTables[idx] = GamingTable(
@@ -1219,7 +1248,7 @@ class FirestoreService {
 
     if (useCloud) {
       try {
-        await _db!.collection('sales').add(sale.toMap());
+        await _db!.collection('sales').doc(sale.id).set(sale.toMap());
         await _db!.collection('tables').doc(table.id).update({
           'status': 'idle',
           'lastStartTime': null,
@@ -1282,9 +1311,128 @@ class FirestoreService {
 
     if (useCloud) {
       try {
-        await _db!.collection('sales').add(sale.toMap());
+        await _db!.collection('sales').doc(sale.id).set(sale.toMap());
       } catch (_) {}
     }
+    await _recordAudit(
+        title: 'فاتورة بيع مباشر',
+        message: 'تم تسجيل بيع مباشر بمبلغ ${totalDrinks.toStringAsFixed(1)} ج.م',
+        beforeVal: 'سلة جديدة',
+        afterVal: '${totalDrinks.toStringAsFixed(1)} ج.م');
+  }
+
+  // تعديل فاتورة بيع مباشر مسجلة بالفعل (تعديل الكميات أو حذف أصناف)
+  Future<void> updateSaleRecord(
+      SaleRecord oldSale, List<AttachedItem> updatedItems) async {
+    final oldTotal = oldSale.totalRevenue;
+
+    // 1. إرجاع الكميات القديمة للمخزن
+    for (final oldItem in oldSale.soldItems) {
+      final iIdx = _localInv.indexWhere((i) => i.id == oldItem.itemId);
+      if (iIdx >= 0) {
+        _localInv[iIdx] = InventoryItem(
+          id: _localInv[iIdx].id,
+          name: _localInv[iIdx].name,
+          price: _localInv[iIdx].price,
+          stock: _localInv[iIdx].stock + oldItem.qty,
+          lowStockThreshold: _localInv[iIdx].lowStockThreshold,
+        );
+      }
+    }
+
+    // 2. خصم الكميات الجديدة من المخزن
+    for (final newItem in updatedItems) {
+      final iIdx = _localInv.indexWhere((i) => i.id == newItem.itemId);
+      if (iIdx >= 0) {
+        _localInv[iIdx] = InventoryItem(
+          id: _localInv[iIdx].id,
+          name: _localInv[iIdx].name,
+          price: _localInv[iIdx].price,
+          stock: (_localInv[iIdx].stock - newItem.qty).clamp(0, 999999),
+          lowStockThreshold: _localInv[iIdx].lowStockThreshold,
+        );
+      }
+    }
+
+    final newDrinksRev =
+        updatedItems.fold<double>(0.0, (sum, item) => sum + item.total);
+    final newTotalRev = oldSale.timeRevenue + newDrinksRev;
+
+    final sIdx = _localSales.indexWhere((s) => s.id == oldSale.id);
+    if (sIdx >= 0) {
+      if (updatedItems.isEmpty && oldSale.timeRevenue <= 0) {
+        _localSales.removeAt(sIdx);
+      } else {
+        _localSales[sIdx] = SaleRecord(
+          id: oldSale.id,
+          type: oldSale.type,
+          timeRevenue: oldSale.timeRevenue,
+          drinksRevenue: newDrinksRev,
+          totalRevenue: newTotalRev,
+          playedSeconds: oldSale.playedSeconds,
+          soldItems: updatedItems,
+          timestamp: oldSale.timestamp,
+          isClosed: oldSale.isClosed,
+        );
+      }
+    }
+
+    _saveAndEmitLocal();
+
+    if (useCloud) {
+      try {
+        if (updatedItems.isEmpty && oldSale.timeRevenue <= 0) {
+          await _db!.collection('sales').doc(oldSale.id).delete();
+        } else {
+          await _db!.collection('sales').doc(oldSale.id).update({
+            'drinksRevenue': newDrinksRev,
+            'totalRevenue': newTotalRev,
+            'soldItems': updatedItems.map((e) => e.toMap()).toList(),
+          });
+        }
+      } catch (_) {}
+    }
+
+    await _recordAudit(
+      title: 'تعديل فاتورة مبيعات',
+      message:
+          'تم تعديل الفاتورة من ${oldTotal.toStringAsFixed(1)} إلى ${newTotalRev.toStringAsFixed(1)} ج.م',
+      beforeVal: '${oldTotal.toStringAsFixed(1)} ج.م',
+      afterVal: '${newTotalRev.toStringAsFixed(1)} ج.م',
+    );
+  }
+
+  // حذف فاتورة بالكامل وإرجاع أصنافها للمخزن
+  Future<void> deleteSaleRecord(SaleRecord sale) async {
+    for (final item in sale.soldItems) {
+      final iIdx = _localInv.indexWhere((i) => i.id == item.itemId);
+      if (iIdx >= 0) {
+        _localInv[iIdx] = InventoryItem(
+          id: _localInv[iIdx].id,
+          name: _localInv[iIdx].name,
+          price: _localInv[iIdx].price,
+          stock: _localInv[iIdx].stock + item.qty,
+          lowStockThreshold: _localInv[iIdx].lowStockThreshold,
+        );
+      }
+    }
+
+    _localSales.removeWhere((s) => s.id == sale.id);
+    _saveAndEmitLocal();
+
+    if (useCloud) {
+      try {
+        await _db!.collection('sales').doc(sale.id).delete();
+      } catch (_) {}
+    }
+
+    await _recordAudit(
+      title: 'إلغاء وحذف فاتورة',
+      message:
+          'تم حذف فاتورة بقيمة ${sale.totalRevenue.toStringAsFixed(1)} ج.م وإرجاع الكميات للمخزن',
+      beforeVal: '${sale.totalRevenue.toStringAsFixed(1)} ج.م',
+      afterVal: 'محذوفة',
+    );
   }
 
   Future<void> closeCurrentDayAndReset(
@@ -1524,17 +1672,21 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
       _showUpdateDialog(update);
     } else if (showNoUpdateToast) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('التطبيق محدث لآخر إصدار ($kCurrentAppVersion)')),
+        const SnackBar(
+            content: Text('التطبيق محدث لآخر إصدار ($kCurrentAppVersion)')),
       );
     }
   }
 
   void _showUpdateDialog(Map<String, dynamic> update) {
     final ver = update['version'] ?? '';
-    final notes = update['notes'] ?? 'تحديث جديد متاح لتحسين الأداء وإضافة مميزات.';
+    final notes =
+        update['notes'] ?? 'تحديث جديد متاح لتحسين الأداء وإضافة مميزات.';
     final url = Platform.isWindows
-        ? (update['windows_url'] ?? 'https://github.com/kirollostharwat-glitch/joker-cafe/releases')
-        : (update['android_url'] ?? 'https://github.com/kirollostharwat-glitch/joker-cafe/releases');
+        ? (update['windows_url'] ??
+            'https://github.com/kirollostharwat-glitch/joker-cafe/releases')
+        : (update['android_url'] ??
+            'https://github.com/kirollostharwat-glitch/joker-cafe/releases');
 
     showDialog(
       context: context,
@@ -1607,8 +1759,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                                     color: Color(0xFF00C896)),
                                 const SizedBox(width: 10),
                                 const Expanded(
-                                  child: Text(
-                                      'Joker Cafe - لوحة التحكم',
+                                  child: Text('Joker Cafe - لوحة التحكم',
                                       style: TextStyle(
                                           fontWeight: FontWeight.bold)),
                                 ),
@@ -1619,9 +1770,10 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                                         ? Colors.amberAccent
                                         : Colors.white70,
                                   ),
-                                  tooltip: 'التحقق من التحديثات (v$kCurrentAppVersion)',
-                                  onPressed: () =>
-                                      _checkRemoteUpdate(showNoUpdateToast: true),
+                                  tooltip:
+                                      'التحقق من التحديثات (v$kCurrentAppVersion)',
+                                  onPressed: () => _checkRemoteUpdate(
+                                      showNoUpdateToast: true),
                                 ),
                                 const SizedBox(width: 6),
                                 Container(
@@ -1727,11 +1879,12 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                           child: _buildTablesSection(tables, inventory)),
                       const VerticalDivider(width: 1),
                       Expanded(
-                          flex: 5, child: _buildPosSection(inventory, tables)),
+                          flex: 5,
+                          child: _buildPosSection(inventory, tables, sales)),
                     ],
                   );
                 case 1:
-                  return _buildPosSection(inventory, tables);
+                  return _buildPosSection(inventory, tables, sales);
                 case 2:
                   return _buildInventorySection(inventory);
                 case 3:
@@ -1757,7 +1910,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
       case 0:
         return _buildTablesSection(tables, inventory);
       case 1:
-        return _buildPosSection(inventory, tables);
+        return _buildPosSection(inventory, tables, sales);
       case 2:
         return _buildInventorySection(inventory);
       case 3:
@@ -1805,8 +1958,9 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
     );
   }
 
-  Widget _buildPosSection(
-      List<InventoryItem> inventory, List<GamingTable> tables) {
+  // قسم الكاشير والبيع المباشر + تعديل فواتير البيع المباشر المسجلة
+  Widget _buildPosSection(List<InventoryItem> inventory,
+      List<GamingTable> tables, List<SaleRecord> sales) {
     double cartTotal = 0;
     final Map<InventoryItem, int> resolvedCart = {};
     for (final item in inventory) {
@@ -1817,103 +1971,358 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
       }
     }
 
-    return Padding(
-      padding: const EdgeInsets.all(16),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Text('الكاشير والمشاريب',
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
-          const SizedBox(height: 12),
-          Expanded(
-            child: GridView.builder(
-              gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-                maxCrossAxisExtent: 180,
-                mainAxisSpacing: 10,
-                crossAxisSpacing: 10,
-                childAspectRatio: 1.1,
-              ),
-              itemCount: inventory.length,
-              itemBuilder: (context, index) {
-                final item = inventory[index];
-                final qtyInCart = _posCart[item.id] ?? 0;
+    final directSales = sales.where((s) => s.type == 'drinks_only').toList();
 
-                return InkWell(
-                  onTap: item.stock > qtyInCart
-                      ? () => setState(() => _posCart[item.id] = qtyInCart + 1)
-                      : null,
-                  child: Card(
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(12),
-                      side: BorderSide(
-                          color: qtyInCart > 0
-                              ? const Color(0xFF00C896)
-                              : Colors.white12,
-                          width: 2),
-                    ),
-                    child: Padding(
-                      padding: const EdgeInsets.all(10),
-                      child: Column(
-                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                        children: [
-                          Text('مخزن: ${item.stock}',
-                              style: const TextStyle(
-                                  fontSize: 10, color: Colors.white60)),
-                          Text(item.name,
-                              style: const TextStyle(
-                                  fontSize: 16, fontWeight: FontWeight.bold)),
-                          Text('${item.price} ج.م',
-                              style: const TextStyle(
-                                  color: Color(0xFF00C896),
-                                  fontWeight: FontWeight.bold)),
-                          if (qtyInCart > 0)
-                            Text('الكمية: $qtyInCart',
-                                style: const TextStyle(
-                                    color: Colors.amber,
-                                    fontWeight: FontWeight.bold)),
-                        ],
-                      ),
-                    ),
-                  ),
-                );
-              },
-            ),
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        const Text('الكاشير والبيع المباشر',
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 12),
+        GridView.builder(
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+            maxCrossAxisExtent: 175,
+            mainAxisSpacing: 10,
+            crossAxisSpacing: 10,
+            childAspectRatio: 0.95,
           ),
-          if (resolvedCart.isNotEmpty)
-            Container(
-              padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(
-                  color: const Color(0xFF181E2C),
-                  borderRadius: BorderRadius.circular(12)),
-              child: Column(
-                children: [
-                  Text('الإجمالي: ${cartTotal.toStringAsFixed(1)} ج.م',
-                      style: const TextStyle(fontWeight: FontWeight.bold)),
-                  const SizedBox(height: 8),
-                  Wrap(
-                    spacing: 8,
-                    runSpacing: 8,
+          itemCount: inventory.length,
+          itemBuilder: (context, index) {
+            final item = inventory[index];
+            final qtyInCart = _posCart[item.id] ?? 0;
+
+            return InkWell(
+              onTap: item.stock > qtyInCart
+                  ? () => setState(() => _posCart[item.id] = qtyInCart + 1)
+                  : null,
+              borderRadius: BorderRadius.circular(12),
+              child: Card(
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  side: BorderSide(
+                      color: qtyInCart > 0
+                          ? const Color(0xFF00C896)
+                          : Colors.white12,
+                      width: 2),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.all(8),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      ElevatedButton(
-                        onPressed: () async {
-                          await widget.db.checkoutDirectPos(resolvedCart);
-                          setState(() => _posCart.clear());
-                        },
-                        child: const Text('بيع مباشر كاشير'),
-                      ),
-                      ...tables.map((t) => OutlinedButton(
-                            onPressed: () async {
-                              await widget.db
-                                  .attachDrinksToTable(t, resolvedCart);
-                              setState(() => _posCart.clear());
-                            },
-                            child: Text('إضافة لـ ${t.name} (Hold)'),
-                          )),
+                      Text('مخزن: ${item.stock}',
+                          style: const TextStyle(
+                              fontSize: 10, color: Colors.white60)),
+                      Text(item.name,
+                          style: const TextStyle(
+                              fontSize: 15, fontWeight: FontWeight.bold),
+                          textAlign: TextAlign.center),
+                      Text('${item.price} ج.م',
+                          style: const TextStyle(
+                              color: Color(0xFF00C896),
+                              fontWeight: FontWeight.bold)),
+                      if (qtyInCart > 0)
+                        Row(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            InkWell(
+                              onTap: () => setState(() {
+                                if (qtyInCart <= 1) {
+                                  _posCart.remove(item.id);
+                                } else {
+                                  _posCart[item.id] = qtyInCart - 1;
+                                }
+                              }),
+                              child: const Icon(Icons.remove_circle,
+                                  color: Colors.orangeAccent, size: 22),
+                            ),
+                            Padding(
+                              padding:
+                                  const EdgeInsets.symmetric(horizontal: 8),
+                              child: Text('$qtyInCart',
+                                  style: const TextStyle(
+                                      color: Colors.amber,
+                                      fontWeight: FontWeight.bold,
+                                      fontSize: 15)),
+                            ),
+                            InkWell(
+                              onTap: item.stock > qtyInCart
+                                  ? () => setState(
+                                      () => _posCart[item.id] = qtyInCart + 1)
+                                  : null,
+                              child: const Icon(Icons.add_circle,
+                                  color: Color(0xFF00C896), size: 22),
+                            ),
+                          ],
+                        ),
                     ],
                   ),
-                ],
+                ),
               ),
+            );
+          },
+        ),
+        if (resolvedCart.isNotEmpty) ...[
+          const SizedBox(height: 12),
+          Container(
+            padding: const EdgeInsets.all(12),
+            decoration: BoxDecoration(
+                color: const Color(0xFF181E2C),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: const Color(0xFF00C896))),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text('إجمالي السلة: ${cartTotal.toStringAsFixed(1)} ج.م',
+                        style: const TextStyle(
+                            fontSize: 16, fontWeight: FontWeight.bold)),
+                    TextButton.icon(
+                      onPressed: () => setState(() => _posCart.clear()),
+                      icon: const Icon(Icons.delete_sweep,
+                          color: Colors.redAccent, size: 18),
+                      label: const Text('تفريغ السلة',
+                          style: TextStyle(color: Colors.redAccent)),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  runSpacing: 8,
+                  children: [
+                    ElevatedButton.icon(
+                      style: ElevatedButton.styleFrom(
+                          backgroundColor: const Color(0xFF00C896),
+                          foregroundColor: Colors.black),
+                      onPressed: () async {
+                        await widget.db.checkoutDirectPos(resolvedCart);
+                        setState(() => _posCart.clear());
+                      },
+                      icon: const Icon(Icons.check_circle),
+                      label: const Text('بيع مباشر كاشير',
+                          style: TextStyle(fontWeight: FontWeight.bold)),
+                    ),
+                    ...tables.map((t) => OutlinedButton(
+                          onPressed: () async {
+                            await widget.db
+                                .attachDrinksToTable(t, resolvedCart);
+                            setState(() => _posCart.clear());
+                          },
+                          child: Text('إضافة لـ ${t.name} (Hold)'),
+                        )),
+                  ],
+                ),
+              ],
             ),
+          ),
+        ],
+        const Divider(height: 32),
+        const Text('فواتير البيع المباشر المسجلة في الشيفت (تعديل / إلغاء):',
+            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 10),
+        if (directSales.isEmpty)
+          const Text('مفيش فواتير بيع مباشر مسجلة في الشيفت الحالي لسه.',
+              style: TextStyle(color: Colors.white60))
+        else
+          ...directSales.map((sale) {
+            final itemsSummary = sale.soldItems
+                .map((e) => '${e.name} × ${e.qty}')
+                .join(' ، ');
+            final timeStr = intl.DateFormat('hh:mm a').format(sale.timestamp);
+            return Card(
+              margin: const EdgeInsets.only(bottom: 8),
+              child: ListTile(
+                leading:
+                    const Icon(Icons.receipt_long, color: Color(0xFF00C896)),
+                title: Text(
+                  '${sale.totalRevenue.toStringAsFixed(1)} ج.م  ($timeStr)',
+                  style: const TextStyle(fontWeight: FontWeight.bold),
+                ),
+                subtitle: Text(itemsSummary),
+                trailing: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    IconButton(
+                      icon: const Icon(Icons.edit, color: Colors.amberAccent),
+                      tooltip: 'تعديل الفاتورة',
+                      onPressed: () => _showEditSaleDialog(sale, inventory),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.delete_outline,
+                          color: Colors.redAccent),
+                      tooltip: 'حذف الفاتورة وإرجاع المخزن',
+                      onPressed: () => _confirmDeleteSaleDialog(sale),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          }),
+      ],
+    );
+  }
+
+  // نافذة تعديل فاتورة بيع مباشر بعد تسجيلها
+  void _showEditSaleDialog(SaleRecord sale, List<InventoryItem> inventory) {
+    final List<AttachedItem> editableItems = List.from(sale.soldItems);
+
+    showDialog(
+      context: context,
+      builder: (dialogCtx) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: const Text('تعديل فاتورة البيع المباشر'),
+          content: SizedBox(
+            width: 420,
+            height: 340,
+            child: Column(
+              children: [
+                if (inventory.isNotEmpty)
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: OutlinedButton.icon(
+                      icon: const Icon(Icons.add),
+                      label: const Text('إضافة صنف آخر للفاتورة'),
+                      onPressed: () {
+                        final firstInv = inventory.first;
+                        setDialogState(() {
+                          final existingIdx = editableItems
+                              .indexWhere((e) => e.itemId == firstInv.id);
+                          if (existingIdx >= 0) {
+                            final ex = editableItems[existingIdx];
+                            editableItems[existingIdx] = AttachedItem(
+                              itemId: ex.itemId,
+                              name: ex.name,
+                              price: ex.price,
+                              qty: ex.qty + 1,
+                            );
+                          } else {
+                            editableItems.add(AttachedItem(
+                              itemId: firstInv.id,
+                              name: firstInv.name,
+                              price: firstInv.price,
+                              qty: 1,
+                            ));
+                          }
+                        });
+                      },
+                    ),
+                  ),
+                const SizedBox(height: 8),
+                Expanded(
+                  child: editableItems.isEmpty
+                      ? const Center(
+                          child: Text(
+                              'الفاتورة أصبحت فارغة (سيتم حذفها عند الحفظ)'))
+                      : ListView.builder(
+                          itemCount: editableItems.length,
+                          itemBuilder: (context, index) {
+                            final item = editableItems[index];
+                            return ListTile(
+                              title: Text(item.name),
+                              subtitle: Text(
+                                  'السعر: ${item.price} ج.م | الإجمالي: ${item.total.toStringAsFixed(1)} ج.م'),
+                              trailing: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  IconButton(
+                                    icon: const Icon(
+                                        Icons.remove_circle_outline,
+                                        color: Colors.orange),
+                                    onPressed: () {
+                                      setDialogState(() {
+                                        if (item.qty > 1) {
+                                          editableItems[index] = AttachedItem(
+                                            itemId: item.itemId,
+                                            name: item.name,
+                                            price: item.price,
+                                            qty: item.qty - 1,
+                                          );
+                                        } else {
+                                          editableItems.removeAt(index);
+                                        }
+                                      });
+                                    },
+                                  ),
+                                  Text('${item.qty}',
+                                      style: const TextStyle(
+                                          fontWeight: FontWeight.bold)),
+                                  IconButton(
+                                    icon: const Icon(Icons.add_circle_outline,
+                                        color: Colors.green),
+                                    onPressed: () {
+                                      setDialogState(() {
+                                        editableItems[index] = AttachedItem(
+                                          itemId: item.itemId,
+                                          name: item.name,
+                                          price: item.price,
+                                          qty: item.qty + 1,
+                                        );
+                                      });
+                                    },
+                                  ),
+                                  IconButton(
+                                    icon: const Icon(Icons.delete,
+                                        color: Colors.red),
+                                    onPressed: () {
+                                      setDialogState(() {
+                                        editableItems.removeAt(index);
+                                      });
+                                    },
+                                  ),
+                                ],
+                              ),
+                            );
+                          },
+                        ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogCtx),
+              child: const Text('إلغاء'),
+            ),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF00C896),
+                  foregroundColor: Colors.black),
+              onPressed: () async {
+                Navigator.pop(dialogCtx);
+                await widget.db.updateSaleRecord(sale, editableItems);
+              },
+              child: const Text('حفظ تعديل الفاتورة'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _confirmDeleteSaleDialog(SaleRecord sale) {
+    showDialog(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        title: const Text('حذف فاتورة البيع المباشر'),
+        content: Text(
+            'هل تريد حذف هذه الفاتورة (${sale.totalRevenue.toStringAsFixed(1)} ج.م) وإرجاع الكميات للمخزن؟'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(dialogCtx),
+              child: const Text('إلغاء')),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
+            onPressed: () async {
+              Navigator.pop(dialogCtx);
+              await widget.db.deleteSaleRecord(sale);
+            },
+            child: const Text('نعم، حذف الفاتورة'),
+          ),
         ],
       ),
     );
@@ -2063,7 +2472,6 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
     );
   }
 
-  // زرار إضافة الترابيزات المُصلح بالكامل
   void _showAddTableDialog() {
     final nameCtrl = TextEditingController();
     final rateCtrl = TextEditingController(text: '50');
@@ -2101,7 +2509,8 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                         color: typeVal == 'normal' ? Colors.black : Colors.white,
                         fontWeight: FontWeight.bold,
                       ),
-                      onSelected: (_) => setDialogState(() => typeVal = 'normal'),
+                      onSelected: (_) =>
+                          setDialogState(() => typeVal = 'normal'),
                     ),
                     ChoiceChip(
                       label: const Text('ترابيزة ألعاب (بساعة)'),
@@ -2111,7 +2520,8 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                         color: typeVal == 'gaming' ? Colors.black : Colors.white,
                         fontWeight: FontWeight.bold,
                       ),
-                      onSelected: (_) => setDialogState(() => typeVal = 'gaming'),
+                      onSelected: (_) =>
+                          setDialogState(() => typeVal = 'gaming'),
                     ),
                   ],
                 ),
@@ -2195,7 +2605,8 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                       labelStyle: TextStyle(
                         color: typeVal == 'normal' ? Colors.black : Colors.white,
                       ),
-                      onSelected: (_) => setDialogState(() => typeVal = 'normal'),
+                      onSelected: (_) =>
+                          setDialogState(() => typeVal = 'normal'),
                     ),
                     ChoiceChip(
                       label: const Text('ترابيزة ألعاب'),
@@ -2204,7 +2615,8 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                       labelStyle: TextStyle(
                         color: typeVal == 'gaming' ? Colors.black : Colors.white,
                       ),
-                      onSelected: (_) => setDialogState(() => typeVal = 'gaming'),
+                      onSelected: (_) =>
+                          setDialogState(() => typeVal = 'gaming'),
                     ),
                   ],
                 ),
