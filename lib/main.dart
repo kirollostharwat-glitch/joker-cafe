@@ -15,43 +15,9 @@ import 'package:uuid/uuid.dart';
 final GlobalKey<ScaffoldMessengerState> rootScaffoldMessengerKey =
     GlobalKey<ScaffoldMessengerState>();
 
-const String kCurrentAppVersion = '1.0.1';
-const String kRemoteVersionJsonUrl =
-    'https://raw.githubusercontent.com/kirollostharwat-glitch/joker-cafe/main/version.json';
-
-class AppUpdateService {
-  static Future> checkForUpdate() async {
-    try {
-      final client = HttpClient()
-        ..connectionTimeout = const Duration(seconds: 5);
-      final req = await client.getUrl(Uri.parse(kRemoteVersionJsonUrl));
-      final res = await req.close();
-      if (res.statusCode == 200) {
-        final body = await res.transform(utf8.decoder).join();
-        final decoded = jsonDecode(body);
-        if (decoded is Map) {
-          final data = Map<String, dynamic>.from(decoded);
-          final latestVersion = (data['version'] ?? '').toString().trim();
-          if (latestVersion.isNotEmpty && latestVersion != kCurrentAppVersion) {
-            return data;
-          }
-        }
-      }
-    } catch (_) {}
-    return <String, dynamic>{};
-  }
-
-  static Future<void> openDownloadUrl(String url) async {
-    try {
-      if (Platform.isWindows) {
-        await Process.run('cmd', ['/c', 'start', '', url]);
-      } else if (Platform.isAndroid) {
-        await Process.run(
-            'am', ['start', '-a', 'android.intent.action.VIEW', '-d', url]);
-      }
-    } catch (_) {}
-  }
-}
+// =============================================================================
+// 1. DATA MODELS
+// =============================================================================
 
 class InventoryItem {
   final String id;
@@ -90,7 +56,8 @@ class InventoryItem {
 
   factory InventoryItem.fromDoc(DocumentSnapshot doc) {
     final raw = doc.data();
-    final data = raw is Map ? Map<String, dynamic>.from(raw) : <String, dynamic>{};
+    final data =
+        raw is Map ? Map<String, dynamic>.from(raw) : <String, dynamic>{};
     return InventoryItem.fromMap(data, doc.id);
   }
 }
@@ -217,7 +184,8 @@ class GamingTable {
 
   factory GamingTable.fromDoc(DocumentSnapshot doc) {
     final raw = doc.data();
-    final data = raw is Map ? Map<String, dynamic>.from(raw) : <String, dynamic>{};
+    final data =
+        raw is Map ? Map<String, dynamic>.from(raw) : <String, dynamic>{};
     return GamingTable.fromMap(data, doc.id);
   }
 }
@@ -286,7 +254,8 @@ class SaleRecord {
 
   factory SaleRecord.fromDoc(DocumentSnapshot doc) {
     final raw = doc.data();
-    final data = raw is Map ? Map<String, dynamic>.from(raw) : <String, dynamic>{};
+    final data =
+        raw is Map ? Map<String, dynamic>.from(raw) : <String, dynamic>{};
     return SaleRecord.fromMap(data, doc.id);
   }
 }
@@ -341,7 +310,8 @@ class ClosedDaySummary {
 
   factory ClosedDaySummary.fromDoc(DocumentSnapshot doc) {
     final raw = doc.data();
-    final data = raw is Map ? Map<String, dynamic>.from(raw) : <String, dynamic>{};
+    final data =
+        raw is Map ? Map<String, dynamic>.from(raw) : <String, dynamic>{};
     return ClosedDaySummary.fromMap(data, doc.id);
   }
 }
@@ -399,10 +369,15 @@ class AuditLog {
 
   factory AuditLog.fromDoc(DocumentSnapshot doc) {
     final raw = doc.data();
-    final data = raw is Map ? Map<String, dynamic>.from(raw) : <String, dynamic>{};
+    final data =
+        raw is Map ? Map<String, dynamic>.from(raw) : <String, dynamic>{};
     return AuditLog.fromMap(data, doc.id);
   }
 }
+
+// =============================================================================
+// 2. NOTIFICATION SERVICE
+// =============================================================================
 
 class NotificationService {
   static final NotificationService _instance = NotificationService._internal();
@@ -451,6 +426,10 @@ class NotificationService {
     } catch (_) {}
   }
 }
+
+// =============================================================================
+// 3. FIRESTORE + AUTO LAN P2P REAL-TIME SYNC SERVICE
+// =============================================================================
 
 class FirestoreService {
   FirebaseFirestore? _db;
@@ -1578,6 +1557,10 @@ class FirestoreService {
   }
 }
 
+// =============================================================================
+// 4. MAIN ENTRY POINT & UI
+// =============================================================================
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   bool firebaseReady = false;
@@ -1643,69 +1626,6 @@ class AdminDashboardShell extends StatefulWidget {
 class _AdminDashboardShellState extends State<AdminDashboardShell> {
   int _selectedIndex = 0;
   final Map<String, int> _posCart = {};
-  Map<String, dynamic> _availableUpdate = {};
-
-  @override
-  void initState() {
-    super.initState();
-    _checkRemoteUpdate();
-  }
-
-  Future<void> _checkRemoteUpdate({bool showNoUpdateToast = false}) async {
-    final update = await AppUpdateService.checkForUpdate();
-    if (!mounted) return;
-    if (update.isNotEmpty) {
-      setState(() => _availableUpdate = update);
-      _showUpdateDialog(update);
-    } else if (showNoUpdateToast) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-            content: Text('التطبيق محدث لآخر إصدار ($kCurrentAppVersion)')),
-      );
-    }
-  }
-
-  void _showUpdateDialog(Map<String, dynamic> update) {
-    final ver = update['version'] ?? '';
-    final notes =
-        update['notes'] ?? 'تحديث جديد متاح لتحسين الأداء وإضافة مميزات.';
-    final url = Platform.isWindows
-        ? (update['windows_url'] ??
-            'https://github.com/kirollostharwat-glitch/joker-cafe/releases')
-        : (update['android_url'] ??
-            'https://github.com/kirollostharwat-glitch/joker-cafe/releases');
-
-    showDialog(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: Row(
-          children: [
-            const Icon(Icons.system_update, color: Color(0xFF00C896)),
-            const SizedBox(width: 8),
-            Text('تحديث جديد متاح ($ver)'),
-          ],
-        ),
-        content: Text(notes),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx),
-            child: const Text('لاحقاً'),
-          ),
-          ElevatedButton.icon(
-            style: ElevatedButton.styleFrom(
-                backgroundColor: const Color(0xFF00C896),
-                foregroundColor: Colors.black),
-            onPressed: () {
-              Navigator.pop(ctx);
-              AppUpdateService.openDownloadUrl(url);
-            },
-            icon: const Icon(Icons.download),
-            label: const Text('تنزيل التحديث الآن'),
-          ),
-        ],
-      ),
-    );
-  }
 
   @override
   Widget build(BuildContext context) {
@@ -1750,19 +1670,6 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                                       style: TextStyle(
                                           fontWeight: FontWeight.bold)),
                                 ),
-                                IconButton(
-                                  icon: Icon(
-                                    Icons.system_update_alt,
-                                    color: _availableUpdate.isNotEmpty
-                                        ? Colors.amberAccent
-                                        : Colors.white70,
-                                  ),
-                                  tooltip:
-                                      'التحقق من التحديثات (v$kCurrentAppVersion)',
-                                  onPressed: () => _checkRemoteUpdate(
-                                      showNoUpdateToast: true),
-                                ),
-                                const SizedBox(width: 6),
                                 Container(
                                   padding: const EdgeInsets.symmetric(
                                       horizontal: 12, vertical: 6),
@@ -2967,6 +2874,10 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
     );
   }
 }
+
+// =============================================================================
+// 5. ISOLATED TABLE CARD WIDGET (ANTI-LAG)
+// =============================================================================
 
 class _TableCardWidget extends StatefulWidget {
   final GamingTable table;
