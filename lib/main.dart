@@ -3,23 +3,52 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
-import 'package:excel/excel.dart' hide Border;
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:google_fonts/google_fonts.dart';
-import 'package:intl/intl.dart' as intl;
-import 'package:path_provider/path_provider.dart';
-import 'package:pdf/pdf.dart';
-import 'package:pdf/widgets.dart' as pw;
-import 'package:printing/printing.dart';
-import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 
 final GlobalKey<ScaffoldMessengerState> rootScaffoldMessengerKey =
     GlobalKey<ScaffoldMessengerState>();
+
+// =============================================================================
+// 0. APP VERSION & REMOTE OTA UPDATE CONFIG (التحديث عن بُعد من جيت هاب)
+// =============================================================================
+const String kCurrentAppVersion = '1.0.0';
+const String kRemoteVersionJsonUrl =
+    'https://raw.githubusercontent.com/kirollostharwat-glitch/joker-cafe/main/version.json';
+
+class AppUpdateService {
+  static Future?> checkForUpdate() async {
+    try {
+      final client = HttpClient()..connectionTimeout = const Duration(seconds: 5);
+      final req = await client.getUrl(Uri.parse(kRemoteVersionJsonUrl));
+      final res = await req.close();
+      if (res.statusCode == 200) {
+        final body = await res.transform(utf8.decoder).join();
+        final data = jsonDecode(body) as Map<String, dynamic>;
+        final latestVersion = (data['version'] ?? '').toString().trim();
+        if (latestVersion.isNotEmpty && latestVersion != kCurrentAppVersion) {
+          return data;
+        }
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  static Future<void> openDownloadUrl(String url) async {
+    try {
+      if (Platform.isWindows) {
+        await Process.run('cmd', ['/c', 'start', '', url]);
+      } else if (Platform.isAndroid) {
+        await Process.run('am', ['start', '-a', 'android.intent.action.VIEW', '-d', url]);
+      }
+    } catch (_) {}
+  }
+}
 
 // =============================================================================
 // 1. DATA MODELS
@@ -137,7 +166,7 @@ class GamingTable {
   double get grandTotal => currentTimeCost + attachedDrinksCost;
 
   String get formattedDuration {
-    if (type == 'normal') return 'قعدة عادية (بدون عداد وقت)';
+    if (type == 'normal') return 'قعدة عادية';
     final totalSecs = currentElapsedSeconds;
     final hrs = (totalSecs ~/ 3600).toString().padLeft(2, '0');
     final mins = ((totalSecs % 3600) ~/ 60).toString().padLeft(2, '0');
@@ -301,7 +330,8 @@ class ClosedDaySummary {
       id: docId ?? data['id'] ?? const Uuid().v4(),
       dateLabel: data['dateLabel'] ?? '',
       drinksRevenue: (data['drinksRevenue'] ?? 0).toDouble(),
-      tablesRevenue: (data['tablesRevenue'] ?? (data['billiardRevenue'] ?? 0)).toDouble(),
+      tablesRevenue:
+          (data['tablesRevenue'] ?? (data['billiardRevenue'] ?? 0)).toDouble(),
       grandTotal: (data['grandTotal'] ?? 0).toDouble(),
       closedAt: parsedTime,
     );
@@ -396,7 +426,7 @@ class NotificationService {
             borderRadius: BorderRadius.circular(12),
             side: const BorderSide(color: Color(0xFF00C896), width: 1.5),
           ),
-          duration: const Duration(seconds: 4),
+          duration: const Duration(seconds: 3),
           content: Row(
             children: [
               const Icon(Icons.notifications_active, color: Color(0xFF00C896)),
@@ -433,7 +463,6 @@ class FirestoreService {
   late String deviceId;
   bool _isInitialAuditLoad = true;
 
-  // Auto P2P LAN Sync sockets (يعمل تلقائياً بين اللاب والموبايل بدون إعدادات)
   ServerSocket? _tcpServer;
   RawDatagramSocket? _udpSocket;
   Timer? _discoveryTimer;
@@ -486,21 +515,20 @@ class FirestoreService {
       _listenToAuditLogsForNotifications();
     }
 
-    // تشغيل محرك المزامنة الشبكية التلقائية الفورية بين اللاب والموبايل
     await _startAutoLanSyncEngine();
   }
 
-  // ---------------------------------------------------------------------------
-  // محرك المزامنة اللحظية التلقائية بين اللاب والموبايل (Auto LAN P2P Sync)
-  // ---------------------------------------------------------------------------
   Future<void> _startAutoLanSyncEngine() async {
     try {
-      _tcpServer = await ServerSocket.bind(InternetAddress.anyIPv4, _syncTcpPort, shared: true);
+      _tcpServer = await ServerSocket.bind(InternetAddress.anyIPv4, _syncTcpPort,
+          shared: true);
       _tcpServer!.listen(_handleIncomingPeerSocket);
     } catch (_) {}
 
     try {
-      _udpSocket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, _syncUdpPort, reuseAddress: true);
+      _udpSocket = await RawDatagramSocket.bind(
+          InternetAddress.anyIPv4, _syncUdpPort,
+          reuseAddress: true);
       _udpSocket!.broadcastEnabled = true;
       _udpSocket!.listen((RawSocketEvent event) {
         if (event == RawSocketEvent.read) {
@@ -519,10 +547,11 @@ class FirestoreService {
         }
       });
 
-      _discoveryTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      _discoveryTimer = Timer.periodic(const Duration(seconds: 3), (_) {
         try {
           final packet = utf8.encode('JOKER_SYNC:$deviceId');
-          _udpSocket?.send(packet, InternetAddress('255.255.255.255'), _syncUdpPort);
+          _udpSocket?.send(
+              packet, InternetAddress('255.255.255.255'), _syncUdpPort);
         } catch (_) {}
       });
     } catch (_) {}
@@ -532,7 +561,8 @@ class FirestoreService {
     if (_connectedPeerIps.contains(ip)) return;
     _connectedPeerIps.add(ip);
     try {
-      final socket = await Socket.connect(ip, _syncTcpPort, timeout: const Duration(seconds: 3));
+      final socket = await Socket.connect(ip, _syncTcpPort,
+          timeout: const Duration(seconds: 3));
       _setupPeerSocket(socket);
     } catch (_) {
       _connectedPeerIps.remove(ip);
@@ -547,7 +577,6 @@ class FirestoreService {
 
   void _setupPeerSocket(Socket socket) {
     _peerSockets.add(socket);
-    // إرسال الحالة الحالية للجهاز المتصل فوراً
     _sendSyncPayloadToSocket(socket);
 
     utf8.decoder
@@ -575,14 +604,17 @@ class FirestoreService {
         'tables': _localTables.map((e) => e.toMap(forLocal: true)).toList(),
         'inv': _localInv.map((e) => e.toMap()).toList(),
         'sales': _localSales.map((e) => e.toMap(forLocal: true)).toList(),
-        'closedDays': _localClosedDays.map((e) => e.toMap(forLocal: true)).toList(),
-        'logs': _localLogs.take(100).map((e) => e.toMap(forLocal: true)).toList(),
+        'closedDays':
+            _localClosedDays.map((e) => e.toMap(forLocal: true)).toList(),
+        'logs':
+            _localLogs.take(100).map((e) => e.toMap(forLocal: true)).toList(),
       });
       s.write('$payload\n');
     } catch (_) {}
   }
 
   void _broadcastLanSync({AuditLog? latestLog}) {
+    if (_peerSockets.isEmpty) return;
     final payload = jsonEncode({
       'type': 'FULL_SYNC',
       'senderId': deviceId,
@@ -590,8 +622,10 @@ class FirestoreService {
       'tables': _localTables.map((e) => e.toMap(forLocal: true)).toList(),
       'inv': _localInv.map((e) => e.toMap()).toList(),
       'sales': _localSales.map((e) => e.toMap(forLocal: true)).toList(),
-      'closedDays': _localClosedDays.map((e) => e.toMap(forLocal: true)).toList(),
-      'logs': _localLogs.take(100).map((e) => e.toMap(forLocal: true)).toList(),
+      'closedDays':
+          _localClosedDays.map((e) => e.toMap(forLocal: true)).toList(),
+      'logs':
+          _localLogs.take(100).map((e) => e.toMap(forLocal: true)).toList(),
       'alertTitle': latestLog?.title,
       'alertBody': latestLog?.message,
     });
@@ -612,7 +646,6 @@ class FirestoreService {
       if (map['senderId'] == deviceId) return;
 
       final incomingTs = (map['ts'] ?? 0) as int;
-      // إذا كان الجهاز الآخر لديه حالة أقدم وحالتنا أحدث، نرسل له حالتنا
       if (incomingTs < _lastStateTimestamp) {
         _broadcastLanSync();
         return;
@@ -661,9 +694,6 @@ class FirestoreService {
     } catch (_) {}
   }
 
-  // ---------------------------------------------------------------------------
-  // Cloud & Local Streams
-  // ---------------------------------------------------------------------------
   void _listenToCloudRealtimeStreams() {
     _db!.collection('tables').snapshots().listen((snapshot) {
       final list = snapshot.docs.map(GamingTable.fromDoc).toList();
@@ -900,31 +930,18 @@ class FirestoreService {
     }
   }
 
-  Stream<List<GamingTable>> streamTables() {
-    Future.microtask(() => _tablesCtrl.add(List.from(_localTables)));
-    return _tablesCtrl.stream;
-  }
+  List<GamingTable> get currentTables => List.from(_localTables);
+  List<InventoryItem> get currentInventory => List.from(_localInv);
+  List<SaleRecord> get currentSales =>
+      _localSales.where((s) => !s.isClosed).toList();
+  List<ClosedDaySummary> get currentClosedDays => List.from(_localClosedDays);
+  List<AuditLog> get currentLogs => List.from(_localLogs);
 
-  Stream<List<InventoryItem>> streamInventory() {
-    Future.microtask(() => _invCtrl.add(List.from(_localInv)));
-    return _invCtrl.stream;
-  }
-
-  Stream<List<SaleRecord>> streamTodaySales() {
-    Future.microtask(
-        () => _salesCtrl.add(_localSales.where((s) => !s.isClosed).toList()));
-    return _salesCtrl.stream;
-  }
-
-  Stream<List<ClosedDaySummary>> streamClosedDays() {
-    Future.microtask(() => _closedDaysCtrl.add(List.from(_localClosedDays)));
-    return _closedDaysCtrl.stream;
-  }
-
-  Stream<List<AuditLog>> streamAuditLogs() {
-    Future.microtask(() => _logsCtrl.add(List.from(_localLogs)));
-    return _logsCtrl.stream;
-  }
+  Stream<List<GamingTable>> streamTables() => _tablesCtrl.stream;
+  Stream<List<InventoryItem>> streamInventory() => _invCtrl.stream;
+  Stream<List<SaleRecord>> streamTodaySales() => _salesCtrl.stream;
+  Stream<List<ClosedDaySummary>> streamClosedDays() => _closedDaysCtrl.stream;
+  Stream<List<AuditLog>> streamAuditLogs() => _logsCtrl.stream;
 
   Future<void> addNewTable(
       {required String name,
@@ -1052,9 +1069,10 @@ class FirestoreService {
     }
   }
 
-  Future<void> updateTableGuestNotes(GamingTable table, String notes) async {
-    final idx = _localTables.indexWhere((t) => t.id == table.id);
+  Future<void> updateTableGuestNotes(String tableId, String notes) async {
+    final idx = _localTables.indexWhere((t) => t.id == tableId);
     if (idx >= 0) {
+      final table = _localTables[idx];
       _localTables[idx] = GamingTable(
           id: table.id,
           name: table.name,
@@ -1071,7 +1089,7 @@ class FirestoreService {
       try {
         await _db!
             .collection('tables')
-            .doc(table.id)
+            .doc(tableId)
             .update({'guestNotes': notes});
       } catch (_) {}
     }
@@ -1422,7 +1440,7 @@ class FirestoreService {
 }
 
 // =============================================================================
-// 4. MAIN ENTRY POINT & UI
+// 4. MAIN ENTRY POINT & ANTI-LAG UI
 // =============================================================================
 
 void main() async {
@@ -1489,45 +1507,83 @@ class AdminDashboardShell extends StatefulWidget {
 
 class _AdminDashboardShellState extends State<AdminDashboardShell> {
   int _selectedIndex = 0;
-  bool _isOnline = true;
-  late StreamSubscription<List<ConnectivityResult>> _connSub;
-  late Timer _liveClockTicker;
   final Map<String, int> _posCart = {};
+  Map<String, dynamic>? _availableUpdate;
 
   @override
   void initState() {
     super.initState();
-    _connSub = Connectivity().onConnectivityChanged.listen((results) {
-      final connected = !results.contains(ConnectivityResult.none);
-      if (mounted && connected != _isOnline) {
-        setState(() => _isOnline = connected);
-      }
-    });
-
-    _liveClockTicker = Timer.periodic(const Duration(seconds: 1), (_) {
-      if (mounted) setState(() {});
-    });
+    _checkRemoteUpdate();
   }
 
-  @override
-  void dispose() {
-    _connSub.cancel();
-    _liveClockTicker.cancel();
-    super.dispose();
+  Future<void> _checkRemoteUpdate({bool showNoUpdateToast = false}) async {
+    final update = await AppUpdateService.checkForUpdate();
+    if (!mounted) return;
+    if (update != null) {
+      setState(() => _availableUpdate = update);
+      _showUpdateDialog(update);
+    } else if (showNoUpdateToast) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('التطبيق محدث لآخر إصدار ($kCurrentAppVersion)')),
+      );
+    }
+  }
+
+  void _showUpdateDialog(Map<String, dynamic> update) {
+    final ver = update['version'] ?? '';
+    final notes = update['notes'] ?? 'تحديث جديد متاح لتحسين الأداء وإضافة مميزات.';
+    final url = Platform.isWindows
+        ? (update['windows_url'] ?? 'https://github.com/kirollostharwat-glitch/joker-cafe/releases')
+        : (update['android_url'] ?? 'https://github.com/kirollostharwat-glitch/joker-cafe/releases');
+
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Row(
+          children: [
+            const Icon(Icons.system_update, color: Color(0xFF00C896)),
+            const SizedBox(width: 8),
+            Text('تحديث جديد متاح ($ver)'),
+          ],
+        ),
+        content: Text(notes),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('لاحقاً'),
+          ),
+          ElevatedButton.icon(
+            style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF00C896),
+                foregroundColor: Colors.black),
+            onPressed: () {
+              Navigator.pop(ctx);
+              AppUpdateService.openDownloadUrl(url);
+            },
+            icon: const Icon(Icons.download),
+            label: const Text('تنزيل التحديث الآن'),
+          ),
+        ],
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     return StreamBuilder<List<GamingTable>>(
+      initialData: widget.db.currentTables,
       stream: widget.db.streamTables(),
       builder: (context, tablesSnap) {
         return StreamBuilder<List<InventoryItem>>(
+          initialData: widget.db.currentInventory,
           stream: widget.db.streamInventory(),
           builder: (context, invSnap) {
             return StreamBuilder<List<SaleRecord>>(
+              initialData: widget.db.currentSales,
               stream: widget.db.streamTodaySales(),
               builder: (context, salesSnap) {
                 return StreamBuilder<List<AuditLog>>(
+                  initialData: widget.db.currentLogs,
                   stream: widget.db.streamAuditLogs(),
                   builder: (context, logsSnap) {
                     final tables = tablesSnap.data ?? [];
@@ -1552,10 +1608,22 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                                 const SizedBox(width: 10),
                                 const Expanded(
                                   child: Text(
-                                      'Joker Cafe - لوحة التحكم (مزامنة حية)',
+                                      'Joker Cafe - لوحة التحكم',
                                       style: TextStyle(
                                           fontWeight: FontWeight.bold)),
                                 ),
+                                IconButton(
+                                  icon: Icon(
+                                    Icons.system_update_alt,
+                                    color: _availableUpdate != null
+                                        ? Colors.amberAccent
+                                        : Colors.white70,
+                                  ),
+                                  tooltip: 'التحقق من التحديثات (v$kCurrentAppVersion)',
+                                  onPressed: () =>
+                                      _checkRemoteUpdate(showNoUpdateToast: true),
+                                ),
+                                const SizedBox(width: 6),
                                 Container(
                                   padding: const EdgeInsets.symmetric(
                                       horizontal: 12, vertical: 6),
@@ -1709,7 +1777,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
         Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
-            const Text('إدارة الترابيزات (مزامنة حية)',
+            const Text('إدارة الترابيزات',
                 style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
             ElevatedButton.icon(
               style: ElevatedButton.styleFrom(
@@ -1722,195 +1790,17 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
           ],
         ),
         const SizedBox(height: 12),
-        ...tables.map((table) => _buildTableCard(table, inventory)),
-      ],
-    );
-  }
-
-  Widget _buildTableCard(GamingTable table, List<InventoryItem> inventory) {
-    final isNormal = table.type == 'normal';
-    final isRunning = table.status == 'running';
-    final statusColor = isNormal
-        ? Colors.purpleAccent
-        : (isRunning ? const Color(0xFF00C896) : Colors.grey);
-
-    return Card(
-      margin: const EdgeInsets.only(bottom: 16),
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(16),
-        side: BorderSide(color: statusColor.withValues(alpha: 0.6), width: 1.5),
-      ),
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Row(
-                  children: [
-                    Icon(
-                        isNormal
-                            ? Icons.table_restaurant
-                            : Icons.sports_esports,
-                        color: statusColor,
-                        size: 26),
-                    const SizedBox(width: 10),
-                    Text(table.name,
-                        style: const TextStyle(
-                            fontSize: 18, fontWeight: FontWeight.bold)),
-                  ],
-                ),
-                Row(
-                  children: [
-                    Chip(
-                      label: Text(isNormal
-                          ? 'ترابيزة عادية'
-                          : 'ساعة: ${table.hourlyRate.toStringAsFixed(0)} ج.م'),
-                      backgroundColor: statusColor.withValues(alpha: 0.2),
-                    ),
-                    const SizedBox(width: 6),
-                    IconButton(
-                      icon: const Icon(Icons.edit,
-                          size: 20, color: Colors.blueAccent),
-                      tooltip: 'تعديل بيانات الترابيزة',
-                      onPressed: () => _showEditTableDialog(table),
-                    ),
-                    IconButton(
-                      icon: const Icon(Icons.delete_outline,
-                          size: 20, color: Colors.redAccent),
-                      tooltip: 'حذف الترابيزة',
-                      onPressed: () => _confirmDeleteTable(table),
-                    ),
-                  ],
-                ),
-              ],
-            ),
-            const Divider(height: 20),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceAround,
-              children: [
-                if (!isNormal)
-                  _metricColumn('الوقت', table.formattedDuration, statusColor),
-                if (!isNormal)
-                  _metricColumn(
-                      'حساب الوقت',
-                      '${table.currentTimeCost.toStringAsFixed(1)} ج.م',
-                      Colors.white),
-                _metricColumn(
-                    'حساب المشاريب (Hold)',
-                    '${table.attachedDrinksCost.toStringAsFixed(1)} ج.م',
-                    Colors.amber),
-                _metricColumn(
-                    'الإجمالي',
-                    '${table.grandTotal.toStringAsFixed(1)} ج.م',
-                    const Color(0xFF00C896)),
-              ],
-            ),
-            const SizedBox(height: 12),
-            TextField(
-              key: ValueKey('notes_${table.id}'),
-              controller: TextEditingController(text: table.guestNotes)
-                ..selection = TextSelection.fromPosition(
-                    TextPosition(offset: table.guestNotes.length)),
-              onChanged: (val) => widget.db.updateTableGuestNotes(table, val),
-              decoration: InputDecoration(
-                labelText:
-                    'أسماء الأشخاص / الملاحظات (متزامن بين اللاب والموبايل)',
-                hintText: 'اكتب أسماء الأشخاص...',
-                prefixIcon: const Icon(Icons.person, color: Color(0xFF00C896)),
-                border:
-                    OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
-                filled: true,
-                fillColor: Colors.black26,
-              ),
-              maxLines: 2,
-            ),
-            if (table.attachedItems.isNotEmpty) ...[
-              const SizedBox(height: 10),
-              Wrap(
-                spacing: 8,
-                children: table.attachedItems
-                    .map((item) => ActionChip(
-                          avatar: const Icon(Icons.edit, size: 14),
-                          label: Text(
-                              '${item.name} × ${item.qty} (${item.total.toStringAsFixed(0)} ج.م)'),
-                          backgroundColor:
-                              Colors.amber.shade900.withValues(alpha: 0.4),
-                          onPressed: () =>
-                              _showEditTableItemsDialog(table, inventory),
-                        ))
-                    .toList(),
-              ),
-            ],
-            const SizedBox(height: 14),
-            Wrap(
-              spacing: 8,
-              runSpacing: 8,
-              children: [
-                if (!isNormal) ...[
-                  ElevatedButton.icon(
-                    style: ElevatedButton.styleFrom(
-                        backgroundColor: const Color(0xFF00C896),
-                        foregroundColor: Colors.black),
-                    onPressed:
-                        isRunning ? null : () => widget.db.startTableTimer(table),
-                    icon: const Icon(Icons.play_arrow),
-                    label: const Text('تشغيل'),
-                  ),
-                  ElevatedButton.icon(
-                    style: ElevatedButton.styleFrom(
-                        backgroundColor: Colors.amber.shade700,
-                        foregroundColor: Colors.black),
-                    onPressed:
-                        isRunning ? () => widget.db.pauseTableTimer(table) : null,
-                    icon: const Icon(Icons.pause),
-                    label: const Text('إيقاف'),
-                  ),
-                ],
-                OutlinedButton.icon(
-                  onPressed: () => _showAttachDrinksDialog(table, inventory),
-                  icon: const Icon(Icons.local_cafe),
-                  label: const Text('إضافة مشاريب (Hold)'),
-                ),
-                if (table.attachedItems.isNotEmpty)
-                  OutlinedButton.icon(
-                    style: OutlinedButton.styleFrom(
-                        foregroundColor: Colors.orangeAccent),
-                    onPressed: () =>
-                        _showEditTableItemsDialog(table, inventory),
-                    icon: const Icon(Icons.edit_note),
-                    label: const Text('تعديل الطلبات'),
-                  ),
-                ElevatedButton.icon(
-                  style: ElevatedButton.styleFrom(
-                      backgroundColor: Colors.redAccent,
-                      foregroundColor: Colors.white),
-                  onPressed: (table.currentElapsedSeconds > 0 ||
-                          table.attachedItems.isNotEmpty)
-                      ? () => _confirmTableCheckout(table)
-                      : null,
-                  icon: const Icon(Icons.receipt),
-                  label: const Text('إنهاء وحساب'),
-                ),
-              ],
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  Widget _metricColumn(String label, String value, Color color) {
-    return Column(
-      children: [
-        Text(label,
-            style: const TextStyle(fontSize: 11, color: Colors.white70)),
-        const SizedBox(height: 2),
-        Text(value,
-            style: TextStyle(
-                fontSize: 15, fontWeight: FontWeight.bold, color: color)),
+        ...tables.map((table) => _TableCardWidget(
+              key: ValueKey('card_${table.id}'),
+              table: table,
+              inventory: inventory,
+              db: widget.db,
+              onEditTable: () => _showEditTableDialog(table),
+              onDeleteTable: () => _confirmDeleteTable(table),
+              onAttachDrinks: () => _showAttachDrinksDialog(table, inventory),
+              onEditItems: () => _showEditTableItemsDialog(table, inventory),
+              onCheckout: () => _confirmTableCheckout(table),
+            )),
       ],
     );
   }
@@ -2085,6 +1975,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
     final grandTotal = drinksRev + tableRev;
 
     return StreamBuilder<List<ClosedDaySummary>>(
+      initialData: widget.db.currentClosedDays,
       stream: widget.db.streamClosedDays(),
       builder: (context, closedSnap) {
         final closedDays = closedSnap.data ?? [];
@@ -2172,56 +2063,97 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
     );
   }
 
+  // زرار إضافة الترابيزات المُصلح بالكامل
   void _showAddTableDialog() {
     final nameCtrl = TextEditingController();
-    final rateCtrl = TextEditingController(text: '0');
+    final rateCtrl = TextEditingController(text: '50');
     String typeVal = 'normal';
 
     showDialog(
       context: context,
-      builder: (_) => StatefulBuilder(
+      builder: (dialogCtx) => StatefulBuilder(
         builder: (context, setDialogState) => AlertDialog(
           title: const Text('إضافة ترابيزة جديدة'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                  controller: nameCtrl,
-                  decoration:
-                      const InputDecoration(labelText: 'اسم الترابيزة')),
-              DropdownButtonFormField<String>(
-                value: typeVal,
-                items: const [
-                  DropdownMenuItem(
-                      value: 'normal', child: Text('ترابيزة عادية (قعدات)')),
-                  DropdownMenuItem(
-                      value: 'gaming', child: Text('ترابيزة ألعاب (بساعة)')),
-                ],
-                onChanged: (val) =>
-                    setDialogState(() => typeVal = val ?? 'normal'),
-              ),
-              if (typeVal == 'gaming')
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
                 TextField(
+                  controller: nameCtrl,
+                  autofocus: true,
+                  decoration: const InputDecoration(
+                    labelText: 'اسم الترابيزة (مثال: ترابيزة 2 أو بلياردو 2)',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 14),
+                const Text('نوع الترابيزة:', style: TextStyle(fontSize: 13)),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 8,
+                  children: [
+                    ChoiceChip(
+                      label: const Text('ترابيزة عادية (قعدات)'),
+                      selected: typeVal == 'normal',
+                      selectedColor: const Color(0xFF00C896),
+                      labelStyle: TextStyle(
+                        color: typeVal == 'normal' ? Colors.black : Colors.white,
+                        fontWeight: FontWeight.bold,
+                      ),
+                      onSelected: (_) => setDialogState(() => typeVal = 'normal'),
+                    ),
+                    ChoiceChip(
+                      label: const Text('ترابيزة ألعاب (بساعة)'),
+                      selected: typeVal == 'gaming',
+                      selectedColor: const Color(0xFF00C896),
+                      labelStyle: TextStyle(
+                        color: typeVal == 'gaming' ? Colors.black : Colors.white,
+                        fontWeight: FontWeight.bold,
+                      ),
+                      onSelected: (_) => setDialogState(() => typeVal = 'gaming'),
+                    ),
+                  ],
+                ),
+                if (typeVal == 'gaming') ...[
+                  const SizedBox(height: 14),
+                  TextField(
                     controller: rateCtrl,
                     keyboardType: TextInputType.number,
-                    decoration: const InputDecoration(labelText: 'سعر الساعة')),
-            ],
+                    decoration: const InputDecoration(
+                      labelText: 'سعر الساعة (ج.م)',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                ],
+              ],
+            ),
           ),
           actions: [
             TextButton(
-                onPressed: () => Navigator.pop(context),
-                child: const Text('إلغاء')),
+              onPressed: () => Navigator.pop(dialogCtx),
+              child: const Text('إلغاء'),
+            ),
             ElevatedButton(
-              onPressed: () {
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF00C896),
+                foregroundColor: Colors.black,
+              ),
+              onPressed: () async {
                 final name = nameCtrl.text.trim();
-                final rate = double.tryParse(rateCtrl.text) ?? 0;
-                if (name.isNotEmpty) {
-                  widget.db
-                      .addNewTable(name: name, type: typeVal, hourlyRate: rate);
-                  Navigator.pop(context);
-                }
+                final rate = typeVal == 'gaming'
+                    ? (double.tryParse(rateCtrl.text) ?? 50.0)
+                    : 0.0;
+                if (name.isEmpty) return;
+                Navigator.pop(dialogCtx);
+                await widget.db.addNewTable(
+                  name: name,
+                  type: typeVal,
+                  hourlyRate: rate,
+                );
               },
-              child: const Text('إضافة'),
+              child: const Text('إضافة الترابيزة',
+                  style: TextStyle(fontWeight: FontWeight.bold)),
             ),
           ],
         ),
@@ -2237,46 +2169,73 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
 
     showDialog(
       context: context,
-      builder: (_) => StatefulBuilder(
+      builder: (dialogCtx) => StatefulBuilder(
         builder: (context, setDialogState) => AlertDialog(
           title: Text('تعديل بيانات: ${table.name}'),
-          content: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                  controller: nameCtrl,
-                  decoration:
-                      const InputDecoration(labelText: 'اسم الترابيزة')),
-              DropdownButtonFormField<String>(
-                value: typeVal,
-                items: const [
-                  DropdownMenuItem(
-                      value: 'normal', child: Text('ترابيزة عادية (قعدات)')),
-                  DropdownMenuItem(
-                      value: 'gaming', child: Text('ترابيزة ألعاب (بساعة)')),
-                ],
-                onChanged: (val) =>
-                    setDialogState(() => typeVal = val ?? 'normal'),
-              ),
-              if (typeVal == 'gaming')
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
                 TextField(
+                  controller: nameCtrl,
+                  decoration: const InputDecoration(
+                    labelText: 'اسم الترابيزة',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Wrap(
+                  spacing: 8,
+                  children: [
+                    ChoiceChip(
+                      label: const Text('ترابيزة عادية'),
+                      selected: typeVal == 'normal',
+                      selectedColor: const Color(0xFF00C896),
+                      labelStyle: TextStyle(
+                        color: typeVal == 'normal' ? Colors.black : Colors.white,
+                      ),
+                      onSelected: (_) => setDialogState(() => typeVal = 'normal'),
+                    ),
+                    ChoiceChip(
+                      label: const Text('ترابيزة ألعاب'),
+                      selected: typeVal == 'gaming',
+                      selectedColor: const Color(0xFF00C896),
+                      labelStyle: TextStyle(
+                        color: typeVal == 'gaming' ? Colors.black : Colors.white,
+                      ),
+                      onSelected: (_) => setDialogState(() => typeVal = 'gaming'),
+                    ),
+                  ],
+                ),
+                if (typeVal == 'gaming') ...[
+                  const SizedBox(height: 12),
+                  TextField(
                     controller: rateCtrl,
                     keyboardType: TextInputType.number,
-                    decoration: const InputDecoration(labelText: 'سعر الساعة')),
-            ],
+                    decoration: const InputDecoration(
+                      labelText: 'سعر الساعة (ج.م)',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                ],
+              ],
+            ),
           ),
           actions: [
             TextButton(
-                onPressed: () => Navigator.pop(context),
-                child: const Text('إلغاء')),
+              onPressed: () => Navigator.pop(dialogCtx),
+              child: const Text('إلغاء'),
+            ),
             ElevatedButton(
-              onPressed: () {
+              onPressed: () async {
                 final name = nameCtrl.text.trim();
-                final rate = double.tryParse(rateCtrl.text) ?? 0;
-                if (name.isNotEmpty) {
-                  widget.db.updateTableDetails(table, name, typeVal, rate);
-                  Navigator.pop(context);
-                }
+                final rate = typeVal == 'gaming'
+                    ? (double.tryParse(rateCtrl.text) ?? 0.0)
+                    : 0.0;
+                if (name.isEmpty) return;
+                Navigator.pop(dialogCtx);
+                await widget.db.updateTableDetails(table, name, typeVal, rate);
               },
               child: const Text('حفظ التعديل'),
             ),
@@ -2289,18 +2248,18 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
   void _confirmDeleteTable(GamingTable table) {
     showDialog(
       context: context,
-      builder: (_) => AlertDialog(
+      builder: (dialogCtx) => AlertDialog(
         title: Text('حذف الترابيزة: ${table.name}'),
         content: const Text('هل أنت متأكد من حذف هذه الترابيزة نهائياً؟'),
         actions: [
           TextButton(
-              onPressed: () => Navigator.pop(context),
+              onPressed: () => Navigator.pop(dialogCtx),
               child: const Text('إلغاء')),
           ElevatedButton(
             style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
             onPressed: () async {
+              Navigator.pop(dialogCtx);
               await widget.db.deleteTable(table);
-              if (mounted) Navigator.pop(context);
             },
             child: const Text('نعم، حذف'),
           ),
@@ -2314,7 +2273,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
     final Map<InventoryItem, int> tempSelection = {};
     showDialog(
       context: context,
-      builder: (_) => StatefulBuilder(
+      builder: (dialogCtx) => StatefulBuilder(
         builder: (context, setDialogState) => AlertDialog(
           title: Text('إضافة مشاريب (Hold) لـ ${table.name}'),
           content: SizedBox(
@@ -2351,15 +2310,15 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
           ),
           actions: [
             TextButton(
-                onPressed: () => Navigator.pop(context),
+                onPressed: () => Navigator.pop(dialogCtx),
                 child: const Text('إلغاء')),
             ElevatedButton(
-              onPressed: () {
+              onPressed: () async {
                 tempSelection.removeWhere((_, v) => v <= 0);
+                Navigator.pop(dialogCtx);
                 if (tempSelection.isNotEmpty) {
-                  widget.db.attachDrinksToTable(table, tempSelection);
+                  await widget.db.attachDrinksToTable(table, tempSelection);
                 }
-                Navigator.pop(context);
               },
               child: const Text('تأكيد (تفضيل Hold)'),
             ),
@@ -2375,7 +2334,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
 
     showDialog(
       context: context,
-      builder: (_) => StatefulBuilder(
+      builder: (dialogCtx) => StatefulBuilder(
         builder: (context, setDialogState) => AlertDialog(
           title: Text('تعديل طلبات وفاتورة: ${table.name}'),
           content: SizedBox(
@@ -2444,14 +2403,14 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
           ),
           actions: [
             TextButton(
-                onPressed: () => Navigator.pop(context),
+                onPressed: () => Navigator.pop(dialogCtx),
                 child: const Text('إلغاء')),
             ElevatedButton(
               onPressed: () async {
+                Navigator.pop(dialogCtx);
                 await widget.db.updateTableAttachedItems(table, editableItems);
-                if (mounted) Navigator.pop(context);
               },
-              child: const Text('حفظ التعديلات اللحظية'),
+              child: const Text('حفظ التعديلات'),
             ),
           ],
         ),
@@ -2462,19 +2421,19 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
   void _confirmTableCheckout(GamingTable table) {
     showDialog(
       context: context,
-      builder: (_) => AlertDialog(
+      builder: (dialogCtx) => AlertDialog(
         title: Text('حساب الترابيزة - ${table.name}'),
         content: Text(
             'الإجمالي المطلوب: ${table.grandTotal.toStringAsFixed(2)} ج.م',
             style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
         actions: [
           TextButton(
-              onPressed: () => Navigator.pop(context),
+              onPressed: () => Navigator.pop(dialogCtx),
               child: const Text('رجوع')),
           ElevatedButton(
             onPressed: () async {
+              Navigator.pop(dialogCtx);
               await widget.db.endAndCheckoutTable(table);
-              if (mounted) Navigator.pop(context);
             },
             child: const Text('تأكيد التحصيل وتصفير الترابيزة'),
           ),
@@ -2486,19 +2445,19 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
   void _confirmCloseDayDialog(double dRev, double tRev, double gTotal) {
     showDialog(
       context: context,
-      builder: (_) => AlertDialog(
+      builder: (dialogCtx) => AlertDialog(
         title: const Text('تقفيل اليوم'),
         content: Text(
             'هل تريد تقفيل اليوم بإجمالي ${gTotal.toStringAsFixed(1)} ج.م وتصفير الشيفت؟'),
         actions: [
           TextButton(
-              onPressed: () => Navigator.pop(context),
+              onPressed: () => Navigator.pop(dialogCtx),
               child: const Text('إلغاء')),
           ElevatedButton(
             onPressed: () async {
+              Navigator.pop(dialogCtx);
               await widget.db.closeCurrentDayAndReset(
                   drinksRev: dRev, tableRev: tRev, grandTotal: gTotal);
-              if (mounted) Navigator.pop(context);
             },
             child: const Text('نعم، قفّل'),
           ),
@@ -2513,7 +2472,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
     final stockCtrl = TextEditingController();
     showDialog(
       context: context,
-      builder: (_) => AlertDialog(
+      builder: (dialogCtx) => AlertDialog(
         title: const Text('إضافة صنف'),
         content: Column(
           mainAxisSize: MainAxisSize.min,
@@ -2533,17 +2492,17 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
         ),
         actions: [
           TextButton(
-              onPressed: () => Navigator.pop(context),
+              onPressed: () => Navigator.pop(dialogCtx),
               child: const Text('إلغاء')),
           ElevatedButton(
-            onPressed: () {
+            onPressed: () async {
               final name = nameCtrl.text.trim();
               final price = double.tryParse(priceCtrl.text) ?? 0;
               final stock = int.tryParse(stockCtrl.text) ?? 0;
               if (name.isNotEmpty && price > 0) {
-                widget.db.addNewInventoryItem(
+                Navigator.pop(dialogCtx);
+                await widget.db.addNewInventoryItem(
                     name: name, price: price, stock: stock, threshold: 5);
-                Navigator.pop(context);
               }
             },
             child: const Text('إضافة'),
@@ -2557,7 +2516,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
     final ctrl = TextEditingController(text: item.price.toStringAsFixed(1));
     showDialog(
       context: context,
-      builder: (_) => AlertDialog(
+      builder: (dialogCtx) => AlertDialog(
         title: Text('تعديل سعر: ${item.name}'),
         content: TextField(
           controller: ctrl,
@@ -2565,14 +2524,14 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
         ),
         actions: [
           TextButton(
-              onPressed: () => Navigator.pop(context),
+              onPressed: () => Navigator.pop(dialogCtx),
               child: const Text('إلغاء')),
           ElevatedButton(
-            onPressed: () {
+            onPressed: () async {
               final val = double.tryParse(ctrl.text);
               if (val != null && val > 0) {
-                widget.db.updateItemPrice(item, val);
-                Navigator.pop(context);
+                Navigator.pop(dialogCtx);
+                await widget.db.updateItemPrice(item, val);
               }
             },
             child: const Text('حفظ'),
@@ -2586,7 +2545,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
     final ctrl = TextEditingController(text: item.stock.toString());
     showDialog(
       context: context,
-      builder: (_) => AlertDialog(
+      builder: (dialogCtx) => AlertDialog(
         title: Text('تعديل الكمية: ${item.name}'),
         content: TextField(
           controller: ctrl,
@@ -2594,20 +2553,294 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
         ),
         actions: [
           TextButton(
-              onPressed: () => Navigator.pop(context),
+              onPressed: () => Navigator.pop(dialogCtx),
               child: const Text('إلغاء')),
           ElevatedButton(
-            onPressed: () {
+            onPressed: () async {
               final val = int.tryParse(ctrl.text);
               if (val != null && val >= 0) {
-                widget.db.updateItemStock(item, val);
-                Navigator.pop(context);
+                Navigator.pop(dialogCtx);
+                await widget.db.updateItemStock(item, val);
               }
             },
             child: const Text('حفظ'),
           ),
         ],
       ),
+    );
+  }
+}
+
+// =============================================================================
+// 5. ISOLATED TABLE CARD WIDGET (يمنع اللاج تماماً أثناء الكتابة وتشغيل الوقت)
+// =============================================================================
+
+class _TableCardWidget extends StatefulWidget {
+  final GamingTable table;
+  final List<InventoryItem> inventory;
+  final FirestoreService db;
+  final VoidCallback onEditTable;
+  final VoidCallback onDeleteTable;
+  final VoidCallback onAttachDrinks;
+  final VoidCallback onEditItems;
+  final VoidCallback onCheckout;
+
+  const _TableCardWidget({
+    super.key,
+    required this.table,
+    required this.inventory,
+    required this.db,
+    required this.onEditTable,
+    required this.onDeleteTable,
+    required this.onAttachDrinks,
+    required this.onEditItems,
+    required this.onCheckout,
+  });
+
+  @override
+  State<_TableCardWidget> createState() => _TableCardWidgetState();
+}
+
+class _TableCardWidgetState extends State<_TableCardWidget> {
+  late TextEditingController _notesCtrl;
+  Timer? _debounceTimer;
+  Timer? _localTimer;
+  bool _isTyping = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _notesCtrl = TextEditingController(text: widget.table.guestNotes);
+    _syncTickerState();
+  }
+
+  @override
+  void didUpdateWidget(covariant _TableCardWidget oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (!_isTyping && widget.table.guestNotes != _notesCtrl.text) {
+      _notesCtrl.text = widget.table.guestNotes;
+    }
+    if (oldWidget.table.status != widget.table.status ||
+        oldWidget.table.type != widget.table.type) {
+      _syncTickerState();
+    }
+  }
+
+  void _syncTickerState() {
+    _localTimer?.cancel();
+    if (widget.table.type == 'gaming' && widget.table.status == 'running') {
+      _localTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+        if (mounted) setState(() {});
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _debounceTimer?.cancel();
+    _localTimer?.cancel();
+    _notesCtrl.dispose();
+    super.dispose();
+  }
+
+  void _onNotesChanged(String val) {
+    _isTyping = true;
+    _debounceTimer?.cancel();
+    _debounceTimer = Timer(const Duration(milliseconds: 600), () async {
+      await widget.db.updateTableGuestNotes(widget.table.id, val);
+      _isTyping = false;
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final table = widget.table;
+    final isNormal = table.type == 'normal';
+    final isRunning = table.status == 'running';
+    final statusColor = isNormal
+        ? Colors.purpleAccent
+        : (isRunning ? const Color(0xFF00C896) : Colors.grey);
+
+    return Card(
+      margin: const EdgeInsets.only(bottom: 16),
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(16),
+        side: BorderSide(color: statusColor.withValues(alpha: 0.6), width: 1.5),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Expanded(
+                  child: Row(
+                    children: [
+                      Icon(
+                          isNormal
+                              ? Icons.table_restaurant
+                              : Icons.sports_esports,
+                          color: statusColor,
+                          size: 26),
+                      const SizedBox(width: 10),
+                      Flexible(
+                        child: Text(table.name,
+                            style: const TextStyle(
+                                fontSize: 18, fontWeight: FontWeight.bold),
+                            overflow: TextOverflow.ellipsis),
+                      ),
+                    ],
+                  ),
+                ),
+                Row(
+                  children: [
+                    Chip(
+                      label: Text(isNormal
+                          ? 'ترابيزة عادية'
+                          : 'ساعة: ${table.hourlyRate.toStringAsFixed(0)} ج.م'),
+                      backgroundColor: statusColor.withValues(alpha: 0.2),
+                    ),
+                    const SizedBox(width: 4),
+                    IconButton(
+                      icon: const Icon(Icons.edit,
+                          size: 20, color: Colors.blueAccent),
+                      tooltip: 'تعديل بيانات الترابيزة',
+                      onPressed: widget.onEditTable,
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.delete_outline,
+                          size: 20, color: Colors.redAccent),
+                      tooltip: 'حذف الترابيزة',
+                      onPressed: widget.onDeleteTable,
+                    ),
+                  ],
+                ),
+              ],
+            ),
+            const Divider(height: 20),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceAround,
+              children: [
+                if (!isNormal)
+                  _metricColumn('الوقت', table.formattedDuration, statusColor),
+                if (!isNormal)
+                  _metricColumn(
+                      'حساب الوقت',
+                      '${table.currentTimeCost.toStringAsFixed(1)} ج.م',
+                      Colors.white),
+                _metricColumn(
+                    'حساب المشاريب (Hold)',
+                    '${table.attachedDrinksCost.toStringAsFixed(1)} ج.م',
+                    Colors.amber),
+                _metricColumn(
+                    'الإجمالي',
+                    '${table.grandTotal.toStringAsFixed(1)} ج.م',
+                    const Color(0xFF00C896)),
+              ],
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _notesCtrl,
+              onChanged: _onNotesChanged,
+              decoration: InputDecoration(
+                labelText: 'أسماء الأشخاص / الملاحظات',
+                hintText: 'اكتب أسماء الأشخاص...',
+                prefixIcon: const Icon(Icons.person, color: Color(0xFF00C896)),
+                border:
+                    OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+                filled: true,
+                fillColor: Colors.black26,
+              ),
+              maxLines: 2,
+            ),
+            if (table.attachedItems.isNotEmpty) ...[
+              const SizedBox(height: 10),
+              Wrap(
+                spacing: 8,
+                runSpacing: 4,
+                children: table.attachedItems
+                    .map((item) => ActionChip(
+                          avatar: const Icon(Icons.edit, size: 14),
+                          label: Text(
+                              '${item.name} × ${item.qty} (${item.total.toStringAsFixed(0)} ج.م)'),
+                          backgroundColor:
+                              Colors.amber.shade900.withValues(alpha: 0.4),
+                          onPressed: widget.onEditItems,
+                        ))
+                    .toList(),
+              ),
+            ],
+            const SizedBox(height: 14),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                if (!isNormal) ...[
+                  ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF00C896),
+                        foregroundColor: Colors.black),
+                    onPressed: isRunning
+                        ? null
+                        : () => widget.db.startTableTimer(table),
+                    icon: const Icon(Icons.play_arrow),
+                    label: const Text('تشغيل'),
+                  ),
+                  ElevatedButton.icon(
+                    style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.amber.shade700,
+                        foregroundColor: Colors.black),
+                    onPressed: isRunning
+                        ? () => widget.db.pauseTableTimer(table)
+                        : null,
+                    icon: const Icon(Icons.pause),
+                    label: const Text('إيقاف'),
+                  ),
+                ],
+                OutlinedButton.icon(
+                  onPressed: widget.onAttachDrinks,
+                  icon: const Icon(Icons.local_cafe),
+                  label: const Text('إضافة مشاريب (Hold)'),
+                ),
+                if (table.attachedItems.isNotEmpty)
+                  OutlinedButton.icon(
+                    style: OutlinedButton.styleFrom(
+                        foregroundColor: Colors.orangeAccent),
+                    onPressed: widget.onEditItems,
+                    icon: const Icon(Icons.edit_note),
+                    label: const Text('تعديل الطلبات'),
+                  ),
+                ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.redAccent,
+                      foregroundColor: Colors.white),
+                  onPressed: (table.currentElapsedSeconds > 0 ||
+                          table.attachedItems.isNotEmpty)
+                      ? widget.onCheckout
+                      : null,
+                  icon: const Icon(Icons.receipt),
+                  label: const Text('إنهاء وحساب'),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _metricColumn(String label, String value, Color color) {
+    return Column(
+      children: [
+        Text(label,
+            style: const TextStyle(fontSize: 11, color: Colors.white70)),
+        const SizedBox(height: 2),
+        Text(value,
+            style: TextStyle(
+                fontSize: 15, fontWeight: FontWeight.bold, color: color)),
+      ],
     );
   }
 }
