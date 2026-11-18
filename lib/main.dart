@@ -16,7 +16,7 @@ final GlobalKey<ScaffoldMessengerState> rootScaffoldMessengerKey =
     GlobalKey<ScaffoldMessengerState>();
 
 // =============================================================================
-// 0. APP VERSION & REMOTE OTA UPDATE CONFIG (التحديث عن بُعد من جيت هاب)
+// 0. APP VERSION & REMOTE OTA UPDATE CONFIG
 // =============================================================================
 const String kCurrentAppVersion = '1.0.1';
 const String kRemoteVersionJsonUrl =
@@ -132,7 +132,7 @@ class GamingTable {
   final String id;
   final String name;
   final double hourlyRate;
-  final String type; // 'gaming' أو 'normal'
+  final String type; // 'gaming' or 'normal'
   final String status; // 'idle', 'running', 'paused'
   final DateTime? lastStartTime;
   final int accumulatedSeconds;
@@ -1100,7 +1100,6 @@ class FirestoreService {
 
   Future<void> updateTableAttachedItems(
       GamingTable table, List<AttachedItem> newItems) async {
-    // حساب فرق المخزن عند تعديل طلبات الترابيزة
     for (final oldItem in table.attachedItems) {
       final iIdx = _localInv.indexWhere((i) => i.id == oldItem.itemId);
       if (iIdx >= 0) {
@@ -1316,17 +1315,16 @@ class FirestoreService {
     }
     await _recordAudit(
         title: 'فاتورة بيع مباشر',
-        message: 'تم تسجيل بيع مباشر بمبلغ ${totalDrinks.toStringAsFixed(1)} ج.م',
+        message:
+            'تم تسجيل بيع مباشر بمبلغ ${totalDrinks.toStringAsFixed(1)} ج.م',
         beforeVal: 'سلة جديدة',
         afterVal: '${totalDrinks.toStringAsFixed(1)} ج.م');
   }
 
-  // تعديل فاتورة بيع مباشر مسجلة بالفعل (تعديل الكميات أو حذف أصناف)
   Future<void> updateSaleRecord(
       SaleRecord oldSale, List<AttachedItem> updatedItems) async {
     final oldTotal = oldSale.totalRevenue;
 
-    // 1. إرجاع الكميات القديمة للمخزن
     for (final oldItem in oldSale.soldItems) {
       final iIdx = _localInv.indexWhere((i) => i.id == oldItem.itemId);
       if (iIdx >= 0) {
@@ -1340,7 +1338,6 @@ class FirestoreService {
       }
     }
 
-    // 2. خصم الكميات الجديدة من المخزن
     for (final newItem in updatedItems) {
       final iIdx = _localInv.indexWhere((i) => i.id == newItem.itemId);
       if (iIdx >= 0) {
@@ -1402,7 +1399,6 @@ class FirestoreService {
     );
   }
 
-  // حذف فاتورة بالكامل وإرجاع أصنافها للمخزن
   Future<void> deleteSaleRecord(SaleRecord sale) async {
     for (final item in sale.soldItems) {
       final iIdx = _localInv.indexWhere((i) => i.id == item.itemId);
@@ -1958,7 +1954,6 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
     );
   }
 
-  // قسم الكاشير والبيع المباشر + تعديل فواتير البيع المباشر المسجلة
   Widget _buildPosSection(List<InventoryItem> inventory,
       List<GamingTable> tables, List<SaleRecord> sales) {
     double cartTotal = 0;
@@ -2167,7 +2162,6 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
     );
   }
 
-  // نافذة تعديل فاتورة بيع مباشر بعد تسجيلها
   void _showEditSaleDialog(SaleRecord sale, List<InventoryItem> inventory) {
     final List<AttachedItem> editableItems = List.from(sale.soldItems);
 
@@ -2984,7 +2978,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
 }
 
 // =============================================================================
-// 5. ISOLATED TABLE CARD WIDGET (يمنع اللاج تماماً أثناء الكتابة وتشغيل الوقت)
+// 5. ISOLATED TABLE CARD WIDGET (ANTI-LAG)
 // =============================================================================
 
 class _TableCardWidget extends StatefulWidget {
