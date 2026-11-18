@@ -100,7 +100,7 @@ class GamingTable {
   final String id;
   final String name;
   final double hourlyRate;
-  final String type; // 'gaming' (بلياردو/بينج) أو 'normal' (ترابيزة قعدات عادية)
+  final String type; // 'gaming' أو 'normal'
   final String status; // 'idle', 'running', 'paused'
   final DateTime? lastStartTime;
   final int accumulatedSeconds;
@@ -432,7 +432,7 @@ class NotificationService {
 }
 
 // =============================================================================
-// 3. FIRESTORE + LOCAL SYNC SERVICE
+// 3. FIRESTORE + LOCAL REAL-TIME SYNC SERVICE
 // =============================================================================
 
 class FirestoreService {
@@ -478,10 +478,34 @@ class FirestoreService {
 
     if (useCloud) {
       await _seedCloudDataIfNeeded();
+      _listenToCloudRealtimeStreams();
       _listenToAuditLogsForNotifications();
     } else {
       _loadAndSeedLocalData();
     }
+  }
+
+  void _listenToCloudRealtimeStreams() {
+    // تفعيل الـ Streams الحية بين الأجهزة لحظياً عبر الفايربيس
+    _db!.collection('tables').snapshots().listen((snapshot) {
+      final list = snapshot.docs.map(GamingTable.fromDoc).toList();
+      _tablesCtrl.add(list);
+    });
+
+    _db!.collection('inventory').snapshots().listen((snapshot) {
+      final list = snapshot.docs.map(InventoryItem.fromDoc).toList();
+      _invCtrl.add(list);
+    });
+
+    _db!.collection('sales').snapshots().listen((snapshot) {
+      final list = snapshot.docs.map(SaleRecord.fromDoc).where((s) => !s.isClosed).toList();
+      _salesCtrl.add(list);
+    });
+
+    _db!.collection('closed_days').orderBy('closedAt', descending: true).snapshots().listen((snapshot) {
+      final list = snapshot.docs.map(ClosedDaySummary.fromDoc).toList();
+      _closedDaysCtrl.add(list);
+    });
   }
 
   void _loadAndSeedLocalData() {
@@ -677,59 +701,32 @@ class FirestoreService {
   }
 
   Stream<List<GamingTable>> streamTables() {
-    if (useCloud) {
-      return _db!
-          .collection('tables')
-          .snapshots()
-          .map((s) => s.docs.map(GamingTable.fromDoc).toList());
-    }
+    if (useCloud) return _tablesCtrl.stream;
     Future.microtask(() => _tablesCtrl.add(List.from(_localTables)));
     return _tablesCtrl.stream;
   }
 
   Stream<List<InventoryItem>> streamInventory() {
-    if (useCloud) {
-      return _db!
-          .collection('inventory')
-          .snapshots()
-          .map((s) => s.docs.map(InventoryItem.fromDoc).toList());
-    }
+    if (useCloud) return _invCtrl.stream;
     Future.microtask(() => _invCtrl.add(List.from(_localInv)));
     return _invCtrl.stream;
   }
 
   Stream<List<SaleRecord>> streamTodaySales() {
-    if (useCloud) {
-      return _db!.collection('sales').snapshots().map((s) => s.docs
-          .map(SaleRecord.fromDoc)
-          .where((sale) => !sale.isClosed)
-          .toList());
-    }
-    Future.microtask(
-        () => _salesCtrl.add(_localSales.where((s) => !s.isClosed).toList()));
+    if (useCloud) return _salesCtrl.stream;
+    Future.microtask(() => _salesCtrl.add(_localSales.where((s) => !s.isClosed).toList()));
     return _salesCtrl.stream;
   }
 
   Stream<List<ClosedDaySummary>> streamClosedDays() {
-    if (useCloud) {
-      return _db!
-          .collection('closed_days')
-          .orderBy('closedAt', descending: true)
-          .snapshots()
-          .map((s) => s.docs.map(ClosedDaySummary.fromDoc).toList());
-    }
+    if (useCloud) return _closedDaysCtrl.stream;
     Future.microtask(() => _closedDaysCtrl.add(List.from(_localClosedDays)));
     return _closedDaysCtrl.stream;
   }
 
   Stream<List<AuditLog>> streamAuditLogs() {
     if (useCloud) {
-      return _db!
-          .collection('audit_logs')
-          .orderBy('timestamp', descending: true)
-          .limit(100)
-          .snapshots()
-          .map((s) => s.docs.map(AuditLog.fromDoc).toList());
+      return _db!.collection('audit_logs').orderBy('timestamp', descending: true).limit(100).snapshots().map((s) => s.docs.map(AuditLog.fromDoc).toList());
     }
     Future.microtask(() => _logsCtrl.add(List.from(_localLogs)));
     return _logsCtrl.stream;
@@ -785,12 +782,6 @@ class FirestoreService {
         _saveAndEmitLocal();
       }
     }
-    await _recordAudit(
-      title: 'تشغيل وقت ترابيزة: ${table.name}',
-      message: 'تم بدء الوقت على ${table.name}',
-      beforeVal: 'متوقفة',
-      afterVal: 'شغالة الآن',
-    );
   }
 
   Future<void> pauseTableTimer(GamingTable table) async {
@@ -839,6 +830,31 @@ class FirestoreService {
           accumulatedSeconds: table.accumulatedSeconds,
           attachedItems: table.attachedItems,
           guestNotes: notes,
+        );
+        _saveAndEmitLocal();
+      }
+    }
+  }
+
+  // تحديث الطلبات والمشاريب بالكامل (تعديل، زيادة، حذف) للترابيزة المفتوحة Hold
+  Future<void> updateTableAttachedItems(GamingTable table, List<AttachedItem> newItems) async {
+    if (useCloud) {
+      await _db!.collection('tables').doc(table.id).update({
+        'attachedItems': newItems.map((e) => e.toMap()).toList(),
+      });
+    } else {
+      final idx = _localTables.indexWhere((t) => t.id == table.id);
+      if (idx >= 0) {
+        _localTables[idx] = GamingTable(
+          id: table.id,
+          name: table.name,
+          hourlyRate: table.hourlyRate,
+          type: table.type,
+          status: table.status,
+          lastStartTime: table.lastStartTime,
+          accumulatedSeconds: table.accumulatedSeconds,
+          attachedItems: newItems,
+          guestNotes: table.guestNotes,
         );
         _saveAndEmitLocal();
       }
@@ -1300,7 +1316,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                                 const Icon(Icons.theater_comedy, color: Color(0xFF00C896)),
                                 const SizedBox(width: 10),
                                 const Expanded(
-                                  child: Text('Joker Cafe - لوحة التحكم', style: TextStyle(fontWeight: FontWeight.bold)),
+                                  child: Text('Joker Cafe - لوحة التحكم (مزامنة حية)', style: TextStyle(fontWeight: FontWeight.bold)),
                                 ),
                                 Container(
                                   padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
@@ -1426,7 +1442,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
         Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
-            const Text('إدارة الترابيزات (ألعاب وقعدات عادية)', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            const Text('إدارة الترابيزات (مزامنة حية)', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
             ElevatedButton.icon(
               style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF00C896), foregroundColor: Colors.black),
               onPressed: _showAddTableDialog,
@@ -1489,8 +1505,8 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                 ..selection = TextSelection.fromPosition(TextPosition(offset: table.guestNotes.length)),
               onChanged: (val) => widget.db.updateTableGuestNotes(table, val),
               decoration: InputDecoration(
-                labelText: 'أسماء الأشخاص / الملاحظات (متزامن لحظياً)',
-                hintText: 'اكتب أسماء الأشخاص على الترابيزة...',
+                labelText: 'أسماء الأشخاص / الملاحظات (متزامن بين اللاب والموبايل)',
+                hintText: 'اكتب أسماء الأشخاص...',
                 prefixIcon: const Icon(Icons.person, color: Color(0xFF00C896)),
                 border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
                 filled: true,
@@ -1502,9 +1518,11 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
               const SizedBox(height: 10),
               Wrap(
                 spacing: 8,
-                children: table.attachedItems.map((item) => Chip(
+                children: table.attachedItems.map((item) => ActionChip(
+                  avatar: const Icon(Icons.edit, size: 14),
                   label: Text('${item.name} × ${item.qty} (${item.total.toStringAsFixed(0)} ج.م)'),
                   backgroundColor: Colors.amber.shade900.withValues(alpha: 0.4),
+                  onPressed: () => _showEditTableItemsDialog(table, inventory),
                 )).toList(),
               ),
             ],
@@ -1532,6 +1550,13 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                   icon: const Icon(Icons.local_cafe),
                   label: const Text('إضافة مشاريب (Hold)'),
                 ),
+                if (table.attachedItems.isNotEmpty)
+                  OutlinedButton.icon(
+                    style: OutlinedButton.styleFrom(foregroundColor: Colors.orangeAccent),
+                    onPressed: () => _showEditTableItemsDialog(table, inventory),
+                    icon: const Icon(Icons.edit_note),
+                    label: const Text('تعديل الطلبات'),
+                  ),
                 ElevatedButton.icon(
                   style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent, foregroundColor: Colors.white),
                   onPressed: (table.currentElapsedSeconds > 0 || table.attachedItems.isNotEmpty)
@@ -1805,6 +1830,89 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                 Navigator.pop(context);
               },
               child: const Text('تأكيد (تفضيل Hold)'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showEditTableItemsDialog(GamingTable table, List<InventoryItem> inventory) {
+    final List<AttachedItem> editableItems = List.from(table.attachedItems);
+
+    showDialog(
+      context: context,
+      builder: (_) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: Text('تعديل طلبات وفاتورة: ${table.name}'),
+          content: SizedBox(
+            width: 400,
+            height: 300,
+            child: editableItems.isEmpty
+                ? const Center(child: Text('مفيش مشاريب مضافة للترابيزة دي حالياً.'))
+                : ListView.builder(
+                    itemCount: editableItems.length,
+                    itemBuilder: (context, index) {
+                      final item = editableItems[index];
+                      return ListTile(
+                        title: Text(item.name),
+                        subtitle: Text('السعر: ${item.price} ج.م | الإجمالي: ${item.total.toStringAsFixed(0)}'),
+                        trailing: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            IconButton(
+                              icon: const Icon(Icons.remove_circle_outline, color: Colors.orange),
+                              onPressed: () {
+                                setDialogState(() {
+                                  if (item.qty > 1) {
+                                    editableItems[index] = AttachedItem(
+                                      itemId: item.itemId,
+                                      name: item.name,
+                                      price: item.price,
+                                      qty: item.qty - 1,
+                                    );
+                                  } else {
+                                    editableItems.removeAt(index);
+                                  }
+                                });
+                              },
+                            ),
+                            Text('${item.qty}', style: const TextStyle(fontWeight: FontWeight.bold)),
+                            IconButton(
+                              icon: const Icon(Icons.add_circle_outline, color: Colors.green),
+                              onPressed: () {
+                                setDialogState(() {
+                                  editableItems[index] = AttachedItem(
+                                    itemId: item.itemId,
+                                    name: item.name,
+                                    price: item.price,
+                                    qty: item.qty + 1,
+                                  );
+                                });
+                              },
+                            ),
+                            IconButton(
+                              icon: const Icon(Icons.delete, color: Colors.red),
+                              onPressed: () {
+                                setDialogState(() {
+                                  editableItems.removeAt(index);
+                                });
+                              },
+                            ),
+                          ],
+                        ),
+                      );
+                    },
+                  ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(context), child: const Text('إلغاء')),
+            ElevatedButton(
+              onPressed: () async {
+                await widget.db.updateTableAttachedItems(table, editableItems);
+                if (mounted) Navigator.pop(context);
+              },
+              child: const Text('حفظ التعديلات اللحظية'),
             ),
           ],
         ),
