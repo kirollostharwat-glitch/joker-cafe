@@ -104,6 +104,7 @@ class GamingTable {
   final DateTime? lastStartTime;
   final int accumulatedSeconds;
   final List<AttachedItem> attachedItems;
+  final String guestNotes; // خانة أسماء الأشخاص والملاحظات لكل ترابيزة
 
   GamingTable({
     required this.id,
@@ -113,6 +114,7 @@ class GamingTable {
     this.lastStartTime,
     required this.accumulatedSeconds,
     required this.attachedItems,
+    this.guestNotes = '',
   });
 
   int get currentElapsedSeconds {
@@ -150,6 +152,7 @@ class GamingTable {
                 : Timestamp.fromDate(lastStartTime!)),
         'accumulatedSeconds': accumulatedSeconds,
         'attachedItems': attachedItems.map((e) => e.toMap()).toList(),
+        'guestNotes': guestNotes,
       };
 
   factory GamingTable.fromMap(Map<String, dynamic> data, [String? docId]) {
@@ -172,6 +175,7 @@ class GamingTable {
       attachedItems: rawList
           .map((e) => AttachedItem.fromMap(Map<String, dynamic>.from(e)))
           .toList(),
+      guestNotes: data['guestNotes'] ?? '',
     );
   }
 
@@ -422,7 +426,7 @@ class NotificationService {
 }
 
 // =============================================================================
-// 3. HYBRID FIRESTORE + LOCAL OFFLINE FALLBACK SERVICE
+// 3. HYBRID FIRESTORE + LOCAL OFFLINE SYNC SERVICE
 // =============================================================================
 
 class FirestoreService {
@@ -615,26 +619,6 @@ class FirestoreService {
               attachedItems: [],
             ).toMap());
       }
-
-      final invSnap = await _db!.collection('inventory').get();
-      if (invSnap.docs.isEmpty) {
-        final initialDrinks = [
-          {'name': 'شاي', 'price': 15.0, 'stock': 100, 'threshold': 15},
-          {'name': 'قهوة تركي', 'price': 25.0, 'stock': 60, 'threshold': 10},
-          {'name': 'نسكافيه', 'price': 30.0, 'stock': 45, 'threshold': 10},
-          {'name': 'بيبسي', 'price': 20.0, 'stock': 50, 'threshold': 12},
-          {'name': 'مية معدنية', 'price': 10.0, 'stock': 80, 'threshold': 20},
-        ];
-
-        for (final item in initialDrinks) {
-          await _db!.collection('inventory').add({
-            'name': item['name'],
-            'price': item['price'],
-            'stock': item['stock'],
-            'lowStockThreshold': item['threshold'],
-          });
-        }
-      }
     } catch (_) {}
   }
 
@@ -766,6 +750,7 @@ class FirestoreService {
           lastStartTime: DateTime.now(),
           accumulatedSeconds: table.accumulatedSeconds,
           attachedItems: table.attachedItems,
+          guestNotes: table.guestNotes,
         );
         _saveAndEmitLocal();
       }
@@ -797,6 +782,7 @@ class FirestoreService {
           lastStartTime: null,
           accumulatedSeconds: totalElapsed,
           attachedItems: table.attachedItems,
+          guestNotes: table.guestNotes,
         );
         _saveAndEmitLocal();
       }
@@ -826,6 +812,7 @@ class FirestoreService {
           lastStartTime: table.lastStartTime,
           accumulatedSeconds: table.accumulatedSeconds,
           attachedItems: table.attachedItems,
+          guestNotes: table.guestNotes,
         );
         _saveAndEmitLocal();
       }
@@ -837,6 +824,29 @@ class FirestoreService {
       beforeVal: '${oldRate.toStringAsFixed(0)} ج.م',
       afterVal: '${newRate.toStringAsFixed(0)} ج.م',
     );
+  }
+
+  Future<void> updateTableGuestNotes(GamingTable table, String notes) async {
+    if (useCloud) {
+      await _db!.collection('tables').doc(table.id).update({
+        'guestNotes': notes,
+      });
+    } else {
+      final idx = _localTables.indexWhere((t) => t.id == table.id);
+      if (idx >= 0) {
+        _localTables[idx] = GamingTable(
+          id: table.id,
+          name: table.name,
+          hourlyRate: table.hourlyRate,
+          status: table.status,
+          lastStartTime: table.lastStartTime,
+          accumulatedSeconds: table.accumulatedSeconds,
+          attachedItems: table.attachedItems,
+          guestNotes: notes,
+        );
+        _saveAndEmitLocal();
+      }
+    }
   }
 
   Future<void> attachDrinksToTable(
@@ -901,6 +911,7 @@ class FirestoreService {
           lastStartTime: table.lastStartTime,
           accumulatedSeconds: table.accumulatedSeconds,
           attachedItems: updatedList,
+          guestNotes: table.guestNotes,
         );
       }
       _saveAndEmitLocal();
@@ -932,6 +943,7 @@ class FirestoreService {
         'lastStartTime': null,
         'accumulatedSeconds': 0,
         'attachedItems': [],
+        'guestNotes': '',
       });
     } else {
       _localSales.insert(0, sale);
@@ -945,6 +957,7 @@ class FirestoreService {
           lastStartTime: null,
           accumulatedSeconds: 0,
           attachedItems: [],
+          guestNotes: '',
         );
       }
       _saveAndEmitLocal();
@@ -1048,6 +1061,7 @@ class FirestoreService {
             'lastStartTime': null,
             'accumulatedSeconds': 0,
             'attachedItems': [],
+            'guestNotes': '',
           });
         }
       }
@@ -1070,6 +1084,7 @@ class FirestoreService {
             lastStartTime: null,
             accumulatedSeconds: 0,
             attachedItems: [],
+            guestNotes: '',
           );
         }
       }
@@ -1558,8 +1573,8 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                                     const SizedBox(width: 8),
                                     Text(
                                       _isOnline
-                                          ? 'متصل بالنت - متزامن لحظياً'
-                                          : 'أوفلاين - هيتم المزامنة أول ما النت يرجع',
+                                          ? 'متصل بالنت - متزامن لحظياً بين اللاب والموبايل'
+                                          : 'أوفلاين - شغال على التخزين المحلي',
                                       style: const TextStyle(
                                           fontSize: 12, color: Colors.white),
                                     ),
@@ -1787,6 +1802,26 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                     '${table.grandTotal.toStringAsFixed(1)} ج.م',
                     const Color(0xFF00C896)),
               ],
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: TextEditingController(text: table.guestNotes)
+                ..selection = TextSelection.fromPosition(
+                    TextPosition(offset: table.guestNotes.length)),
+              onChanged: (val) {
+                widget.db.updateTableGuestNotes(table, val);
+              },
+              decoration: InputDecoration(
+                labelText: 'أسماء الأشخاص / ملاحظات الطرابيزة',
+                hintText: 'اكتب اسم كل شخص هنا (متزامن لحظياً)...',
+                prefixIcon: const Icon(Icons.note_alt, color: Color(0xFF00C896)),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                filled: true,
+                fillColor: Colors.black26,
+              ),
+              maxLines: 2,
             ),
             if (table.attachedItems.isNotEmpty) ...[
               const SizedBox(height: 12),
@@ -2556,7 +2591,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                   stock: stock,
                   threshold: 10,
                 );
-                Navigator.pop(context);
+                Navigator.pop(context, true);
               }
             },
             child: const Text('إضافة'),
@@ -2611,6 +2646,8 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
               child: const Text('إلغاء')),
           ElevatedButton(
             onPressed: () {
+              val:
+              int.tryParse(ctrl.text);
               final val = int.tryParse(ctrl.text);
               if (val != null && val >= 0) {
                 widget.db.updateItemStock(item, val);
