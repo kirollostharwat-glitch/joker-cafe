@@ -105,7 +105,7 @@ class GamingTable {
   final DateTime? lastStartTime;
   final int accumulatedSeconds;
   final List<AttachedItem> attachedItems;
-  final String guestNotes; // أسماء الأشخاص والملاحظات للترابيزة
+  final String guestNotes;
 
   GamingTable({
     required this.id,
@@ -128,7 +128,8 @@ class GamingTable {
     return accumulatedSeconds;
   }
 
-  double get currentTimeCost => type == 'normal' ? 0.0 : (currentElapsedSeconds / 3600.0) * hourlyRate;
+  double get currentTimeCost =>
+      type == 'normal' ? 0.0 : (currentElapsedSeconds / 3600.0) * hourlyRate;
 
   double get attachedDrinksCost =>
       attachedItems.fold(0.0, (sum, item) => sum + item.total);
@@ -263,8 +264,7 @@ class ClosedDaySummary {
   final String id;
   final String dateLabel;
   final double drinksRevenue;
-  final double billiardRevenue;
-  final double pingPongRevenue;
+  final double tablesRevenue;
   final double grandTotal;
   final DateTime closedAt;
 
@@ -272,8 +272,7 @@ class ClosedDaySummary {
     required this.id,
     required this.dateLabel,
     required this.drinksRevenue,
-    required this.billiardRevenue,
-    required this.pingPongRevenue,
+    required this.tablesRevenue,
     required this.grandTotal,
     required this.closedAt,
   });
@@ -282,8 +281,7 @@ class ClosedDaySummary {
         'id': id,
         'dateLabel': dateLabel,
         'drinksRevenue': drinksRevenue,
-        'billiardRevenue': billiardRevenue,
-        'pingPongRevenue': pingPongRevenue,
+        'tablesRevenue': tablesRevenue,
         'grandTotal': grandTotal,
         'closedAt': forLocal
             ? closedAt.toIso8601String()
@@ -303,8 +301,7 @@ class ClosedDaySummary {
       id: docId ?? data['id'] ?? const Uuid().v4(),
       dateLabel: data['dateLabel'] ?? '',
       drinksRevenue: (data['drinksRevenue'] ?? 0).toDouble(),
-      billiardRevenue: (data['billiardRevenue'] ?? 0).toDouble(),
-      pingPongRevenue: (data['pingPongRevenue'] ?? 0).toDouble(),
+      tablesRevenue: (data['tablesRevenue'] ?? (data['billiardRevenue'] ?? 0)).toDouble(),
       grandTotal: (data['grandTotal'] ?? 0).toDouble(),
       closedAt: parsedTime,
     );
@@ -409,17 +406,11 @@ class NotificationService {
                   mainAxisSize: MainAxisSize.min,
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(
-                      title,
-                      style: const TextStyle(
-                        fontWeight: FontWeight.bold,
-                        color: Color(0xFF00C896),
-                      ),
-                    ),
-                    Text(
-                      body,
-                      style: const TextStyle(color: Colors.white),
-                    ),
+                    Text(title,
+                        style: const TextStyle(
+                            fontWeight: FontWeight.bold,
+                            color: Color(0xFF00C896))),
+                    Text(body, style: const TextStyle(color: Colors.white)),
                   ],
                 ),
               ),
@@ -432,7 +423,7 @@ class NotificationService {
 }
 
 // =============================================================================
-// 3. FIRESTORE + LOCAL REAL-TIME SYNC SERVICE
+// 3. FIRESTORE + AUTO LAN P2P REAL-TIME SYNC SERVICE
 // =============================================================================
 
 class FirestoreService {
@@ -441,6 +432,16 @@ class FirestoreService {
   late SharedPreferences _prefs;
   late String deviceId;
   bool _isInitialAuditLoad = true;
+
+  // Auto P2P LAN Sync sockets (يعمل تلقائياً بين اللاب والموبايل بدون إعدادات)
+  ServerSocket? _tcpServer;
+  RawDatagramSocket? _udpSocket;
+  Timer? _discoveryTimer;
+  final List<Socket> _peerSockets = [];
+  final Set<String> _connectedPeerIps = {};
+  static const int _syncTcpPort = 45454;
+  static const int _syncUdpPort = 45455;
+  int _lastStateTimestamp = 0;
 
   final _tablesCtrl = StreamController<List<GamingTable>>.broadcast();
   final _invCtrl = StreamController<List<InventoryItem>>.broadcast();
@@ -462,6 +463,7 @@ class FirestoreService {
       await _prefs.setString('device_instance_id', storedId);
     }
     deviceId = storedId;
+    _lastStateTimestamp = _prefs.getInt('last_state_ts') ?? 0;
 
     if (firebaseReady) {
       try {
@@ -476,33 +478,225 @@ class FirestoreService {
       }
     }
 
+    _loadAndSeedLocalData();
+
     if (useCloud) {
       await _seedCloudDataIfNeeded();
       _listenToCloudRealtimeStreams();
       _listenToAuditLogsForNotifications();
-    } else {
-      _loadAndSeedLocalData();
+    }
+
+    // تشغيل محرك المزامنة الشبكية التلقائية الفورية بين اللاب والموبايل
+    await _startAutoLanSyncEngine();
+  }
+
+  // ---------------------------------------------------------------------------
+  // محرك المزامنة اللحظية التلقائية بين اللاب والموبايل (Auto LAN P2P Sync)
+  // ---------------------------------------------------------------------------
+  Future<void> _startAutoLanSyncEngine() async {
+    try {
+      _tcpServer = await ServerSocket.bind(InternetAddress.anyIPv4, _syncTcpPort, shared: true);
+      _tcpServer!.listen(_handleIncomingPeerSocket);
+    } catch (_) {}
+
+    try {
+      _udpSocket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, _syncUdpPort, reuseAddress: true);
+      _udpSocket!.broadcastEnabled = true;
+      _udpSocket!.listen((RawSocketEvent event) {
+        if (event == RawSocketEvent.read) {
+          final dg = _udpSocket!.receive();
+          if (dg == null) return;
+          final msg = utf8.decode(dg.data, allowMalformed: true);
+          if (msg.startsWith('JOKER_SYNC:')) {
+            final senderDeviceId = msg.substring('JOKER_SYNC:'.length).trim();
+            if (senderDeviceId != deviceId) {
+              final peerIp = dg.address.address;
+              if (!_connectedPeerIps.contains(peerIp)) {
+                _connectToPeer(peerIp);
+              }
+            }
+          }
+        }
+      });
+
+      _discoveryTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+        try {
+          final packet = utf8.encode('JOKER_SYNC:$deviceId');
+          _udpSocket?.send(packet, InternetAddress('255.255.255.255'), _syncUdpPort);
+        } catch (_) {}
+      });
+    } catch (_) {}
+  }
+
+  Future<void> _connectToPeer(String ip) async {
+    if (_connectedPeerIps.contains(ip)) return;
+    _connectedPeerIps.add(ip);
+    try {
+      final socket = await Socket.connect(ip, _syncTcpPort, timeout: const Duration(seconds: 3));
+      _setupPeerSocket(socket);
+    } catch (_) {
+      _connectedPeerIps.remove(ip);
     }
   }
 
+  void _handleIncomingPeerSocket(Socket socket) {
+    final ip = socket.remoteAddress.address;
+    _connectedPeerIps.add(ip);
+    _setupPeerSocket(socket);
+  }
+
+  void _setupPeerSocket(Socket socket) {
+    _peerSockets.add(socket);
+    // إرسال الحالة الحالية للجهاز المتصل فوراً
+    _sendSyncPayloadToSocket(socket);
+
+    utf8.decoder
+        .bind(socket)
+        .transform(const LineSplitter())
+        .listen((String line) {
+      if (line.trim().isNotEmpty) {
+        _handleReceivedSyncLine(line);
+      }
+    }, onDone: () {
+      _peerSockets.remove(socket);
+      _connectedPeerIps.remove(socket.remoteAddress.address);
+    }, onError: (_) {
+      _peerSockets.remove(socket);
+      _connectedPeerIps.remove(socket.remoteAddress.address);
+    });
+  }
+
+  void _sendSyncPayloadToSocket(Socket s) {
+    try {
+      final payload = jsonEncode({
+        'type': 'FULL_SYNC',
+        'senderId': deviceId,
+        'ts': _lastStateTimestamp,
+        'tables': _localTables.map((e) => e.toMap(forLocal: true)).toList(),
+        'inv': _localInv.map((e) => e.toMap()).toList(),
+        'sales': _localSales.map((e) => e.toMap(forLocal: true)).toList(),
+        'closedDays': _localClosedDays.map((e) => e.toMap(forLocal: true)).toList(),
+        'logs': _localLogs.take(100).map((e) => e.toMap(forLocal: true)).toList(),
+      });
+      s.write('$payload\n');
+    } catch (_) {}
+  }
+
+  void _broadcastLanSync({AuditLog? latestLog}) {
+    final payload = jsonEncode({
+      'type': 'FULL_SYNC',
+      'senderId': deviceId,
+      'ts': _lastStateTimestamp,
+      'tables': _localTables.map((e) => e.toMap(forLocal: true)).toList(),
+      'inv': _localInv.map((e) => e.toMap()).toList(),
+      'sales': _localSales.map((e) => e.toMap(forLocal: true)).toList(),
+      'closedDays': _localClosedDays.map((e) => e.toMap(forLocal: true)).toList(),
+      'logs': _localLogs.take(100).map((e) => e.toMap(forLocal: true)).toList(),
+      'alertTitle': latestLog?.title,
+      'alertBody': latestLog?.message,
+    });
+
+    for (final s in List<Socket>.from(_peerSockets)) {
+      try {
+        s.write('$payload\n');
+      } catch (_) {
+        _peerSockets.remove(s);
+      }
+    }
+  }
+
+  void _handleReceivedSyncLine(String line) {
+    try {
+      final map = jsonDecode(line) as Map<String, dynamic>;
+      if (map['type'] != 'FULL_SYNC') return;
+      if (map['senderId'] == deviceId) return;
+
+      final incomingTs = (map['ts'] ?? 0) as int;
+      // إذا كان الجهاز الآخر لديه حالة أقدم وحالتنا أحدث، نرسل له حالتنا
+      if (incomingTs < _lastStateTimestamp) {
+        _broadcastLanSync();
+        return;
+      }
+
+      _lastStateTimestamp = incomingTs;
+      _prefs.setInt('last_state_ts', _lastStateTimestamp);
+
+      if (map['tables'] != null) {
+        _localTables = (map['tables'] as List)
+            .map((e) => GamingTable.fromMap(Map<String, dynamic>.from(e)))
+            .toList();
+      }
+      if (map['inv'] != null) {
+        _localInv = (map['inv'] as List)
+            .map((e) => InventoryItem.fromMap(Map<String, dynamic>.from(e)))
+            .toList();
+      }
+      if (map['sales'] != null) {
+        _localSales = (map['sales'] as List)
+            .map((e) => SaleRecord.fromMap(Map<String, dynamic>.from(e)))
+            .toList();
+      }
+      if (map['closedDays'] != null) {
+        _localClosedDays = (map['closedDays'] as List)
+            .map((e) => ClosedDaySummary.fromMap(Map<String, dynamic>.from(e)))
+            .toList();
+      }
+      if (map['logs'] != null) {
+        _localLogs = (map['logs'] as List)
+            .map((e) => AuditLog.fromMap(Map<String, dynamic>.from(e)))
+            .toList();
+      }
+
+      _saveAndEmitLocal(broadcastToPeers: false);
+
+      final alertTitle = map['alertTitle'] as String?;
+      final alertBody = map['alertBody'] as String?;
+      if (alertTitle != null && alertBody != null) {
+        NotificationService().showEgyptianAlert(
+          id: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+          title: alertTitle,
+          body: alertBody,
+        );
+      }
+    } catch (_) {}
+  }
+
+  // ---------------------------------------------------------------------------
+  // Cloud & Local Streams
+  // ---------------------------------------------------------------------------
   void _listenToCloudRealtimeStreams() {
     _db!.collection('tables').snapshots().listen((snapshot) {
       final list = snapshot.docs.map(GamingTable.fromDoc).toList();
-      _tablesCtrl.add(list);
+      if (list.isNotEmpty) {
+        _localTables = list;
+        _tablesCtrl.add(list);
+      }
     });
 
     _db!.collection('inventory').snapshots().listen((snapshot) {
       final list = snapshot.docs.map(InventoryItem.fromDoc).toList();
-      _invCtrl.add(list);
+      if (list.isNotEmpty) {
+        _localInv = list;
+        _invCtrl.add(list);
+      }
     });
 
     _db!.collection('sales').snapshots().listen((snapshot) {
-      final list = snapshot.docs.map(SaleRecord.fromDoc).where((s) => !s.isClosed).toList();
+      final list = snapshot.docs
+          .map(SaleRecord.fromDoc)
+          .where((s) => !s.isClosed)
+          .toList();
+      _localSales = list;
       _salesCtrl.add(list);
     });
 
-    _db!.collection('closed_days').orderBy('closedAt', descending: true).snapshots().listen((snapshot) {
+    _db!
+        .collection('closed_days')
+        .orderBy('closedAt', descending: true)
+        .snapshots()
+        .listen((snapshot) {
       final list = snapshot.docs.map(ClosedDaySummary.fromDoc).toList();
+      _localClosedDays = list;
       _closedDaysCtrl.add(list);
     });
   }
@@ -517,32 +711,29 @@ class FirestoreService {
     } else {
       _localTables = [
         GamingTable(
-          id: 'billiard',
-          name: 'ترابيزة البلياردو',
-          hourlyRate: 60.0,
-          type: 'gaming',
-          status: 'idle',
-          accumulatedSeconds: 0,
-          attachedItems: [],
-        ),
+            id: 'billiard',
+            name: 'ترابيزة البلياردو',
+            hourlyRate: 60.0,
+            type: 'gaming',
+            status: 'idle',
+            accumulatedSeconds: 0,
+            attachedItems: []),
         GamingTable(
-          id: 'pingpong',
-          name: 'ترابيزة البينج بونج',
-          hourlyRate: 45.0,
-          type: 'gaming',
-          status: 'idle',
-          accumulatedSeconds: 0,
-          attachedItems: [],
-        ),
+            id: 'pingpong',
+            name: 'ترابيزة البينج بونج',
+            hourlyRate: 45.0,
+            type: 'gaming',
+            status: 'idle',
+            accumulatedSeconds: 0,
+            attachedItems: []),
         GamingTable(
-          id: 'table_normal_1',
-          name: 'ترابيزة قعدة عادية 1',
-          hourlyRate: 0.0,
-          type: 'normal',
-          status: 'idle',
-          accumulatedSeconds: 0,
-          attachedItems: [],
-        ),
+            id: 'table_normal_1',
+            name: 'ترابيزة قعدة عادية 1',
+            hourlyRate: 0.0,
+            type: 'normal',
+            status: 'idle',
+            accumulatedSeconds: 0,
+            attachedItems: []),
       ];
     }
 
@@ -554,11 +745,36 @@ class FirestoreService {
           .toList();
     } else {
       _localInv = [
-        InventoryItem(id: '1', name: 'شاي', price: 15.0, stock: 100, lowStockThreshold: 15),
-        InventoryItem(id: '2', name: 'قهوة تركي', price: 25.0, stock: 60, lowStockThreshold: 10),
-        InventoryItem(id: '3', name: 'نسكافيه', price: 30.0, stock: 45, lowStockThreshold: 10),
-        InventoryItem(id: '4', name: 'بيبسي', price: 20.0, stock: 50, lowStockThreshold: 12),
-        InventoryItem(id: '5', name: 'مية معدنية', price: 10.0, stock: 80, lowStockThreshold: 20),
+        InventoryItem(
+            id: '1',
+            name: 'شاي',
+            price: 15.0,
+            stock: 100,
+            lowStockThreshold: 15),
+        InventoryItem(
+            id: '2',
+            name: 'قهوة تركي',
+            price: 25.0,
+            stock: 60,
+            lowStockThreshold: 10),
+        InventoryItem(
+            id: '3',
+            name: 'نسكافيه',
+            price: 30.0,
+            stock: 45,
+            lowStockThreshold: 10),
+        InventoryItem(
+            id: '4',
+            name: 'بيبسي',
+            price: 20.0,
+            stock: 50,
+            lowStockThreshold: 12),
+        InventoryItem(
+            id: '5',
+            name: 'مية معدنية',
+            price: 10.0,
+            stock: 80,
+            lowStockThreshold: 20),
       ];
     }
 
@@ -586,12 +802,16 @@ class FirestoreService {
           .toList();
     }
 
-    _saveAndEmitLocal();
+    _saveAndEmitLocal(broadcastToPeers: false);
   }
 
-  void _saveAndEmitLocal() {
-    _prefs.setString(
-        'local_tables',
+  void _saveAndEmitLocal({bool broadcastToPeers = true, AuditLog? latestLog}) {
+    if (broadcastToPeers) {
+      _lastStateTimestamp = DateTime.now().millisecondsSinceEpoch;
+      _prefs.setInt('last_state_ts', _lastStateTimestamp);
+    }
+
+    _prefs.setString('local_tables',
         jsonEncode(_localTables.map((e) => e.toMap(forLocal: true)).toList()));
     _prefs.setString(
         'local_inv', jsonEncode(_localInv.map((e) => e.toMap()).toList()));
@@ -599,7 +819,8 @@ class FirestoreService {
         jsonEncode(_localSales.map((e) => e.toMap(forLocal: true)).toList()));
     _prefs.setString(
         'local_closed_days',
-        jsonEncode(_localClosedDays.map((e) => e.toMap(forLocal: true)).toList()));
+        jsonEncode(
+            _localClosedDays.map((e) => e.toMap(forLocal: true)).toList()));
     _prefs.setString('local_logs',
         jsonEncode(_localLogs.map((e) => e.toMap(forLocal: true)).toList()));
 
@@ -608,41 +829,25 @@ class FirestoreService {
     _salesCtrl.add(_localSales.where((s) => !s.isClosed).toList());
     _closedDaysCtrl.add(List.from(_localClosedDays));
     _logsCtrl.add(List.from(_localLogs));
+
+    if (broadcastToPeers) {
+      _broadcastLanSync(latestLog: latestLog);
+    }
   }
 
   Future<void> _seedCloudDataIfNeeded() async {
     try {
       final tablesSnap = await _db!.collection('tables').get();
       if (tablesSnap.docs.isEmpty) {
-        await _db!.collection('tables').doc('billiard').set(GamingTable(
-              id: 'billiard',
-              name: 'ترابيزة البلياردو',
-              hourlyRate: 60.0,
-              type: 'gaming',
-              status: 'idle',
-              accumulatedSeconds: 0,
-              attachedItems: [],
-            ).toMap());
-
-        await _db!.collection('tables').doc('pingpong').set(GamingTable(
-              id: 'pingpong',
-              name: 'ترابيزة البينج بونج',
-              hourlyRate: 45.0,
-              type: 'gaming',
-              status: 'idle',
-              accumulatedSeconds: 0,
-              attachedItems: [],
-            ).toMap());
-
-        await _db!.collection('tables').doc('table_normal_1').set(GamingTable(
-              id: 'table_normal_1',
-              name: 'ترابيزة قعدة عادية 1',
-              hourlyRate: 0.0,
-              type: 'normal',
-              status: 'idle',
-              accumulatedSeconds: 0,
-              attachedItems: [],
-            ).toMap());
+        for (final t in _localTables) {
+          await _db!.collection('tables').doc(t.id).set(t.toMap());
+        }
+      }
+      final invSnap = await _db!.collection('inventory').get();
+      if (invSnap.docs.isEmpty) {
+        for (final item in _localInv) {
+          await _db!.collection('inventory').doc(item.id).set(item.toMap());
+        }
       }
     } catch (_) {}
   }
@@ -658,133 +863,118 @@ class FirestoreService {
         _isInitialAuditLoad = false;
         return;
       }
-
       for (final change in snapshot.docChanges) {
         if (change.type == DocumentChangeType.added) {
           if (change.doc.metadata.hasPendingWrites) continue;
           final log = AuditLog.fromDoc(change.doc);
           if (log.deviceId == deviceId) continue;
-
           NotificationService().showEgyptianAlert(
-            id: DateTime.now().millisecondsSinceEpoch ~/ 1000,
-            title: log.title,
-            body: log.message,
-          );
+              id: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+              title: log.title,
+              body: log.message);
         }
       }
     });
   }
 
-  Future<void> _recordAudit({
-    required String title,
-    required String message,
-    required String beforeVal,
-    required String afterVal,
-  }) async {
+  Future<void> _recordAudit(
+      {required String title,
+      required String message,
+      required String beforeVal,
+      required String afterVal}) async {
     final log = AuditLog(
-      id: const Uuid().v4(),
-      title: title,
-      message: message,
-      beforeVal: beforeVal,
-      afterVal: afterVal,
-      deviceId: deviceId,
-      timestamp: DateTime.now(),
-    );
+        id: const Uuid().v4(),
+        title: title,
+        message: message,
+        beforeVal: beforeVal,
+        afterVal: afterVal,
+        deviceId: deviceId,
+        timestamp: DateTime.now());
+    _localLogs.insert(0, log);
+    _saveAndEmitLocal(latestLog: log);
 
     if (useCloud) {
-      await _db!.collection('audit_logs').add(log.toMap());
-    } else {
-      _localLogs.insert(0, log);
-      _saveAndEmitLocal();
+      try {
+        await _db!.collection('audit_logs').add(log.toMap());
+      } catch (_) {}
     }
   }
 
   Stream<List<GamingTable>> streamTables() {
-    if (useCloud) return _tablesCtrl.stream;
     Future.microtask(() => _tablesCtrl.add(List.from(_localTables)));
     return _tablesCtrl.stream;
   }
 
   Stream<List<InventoryItem>> streamInventory() {
-    if (useCloud) return _invCtrl.stream;
     Future.microtask(() => _invCtrl.add(List.from(_localInv)));
     return _invCtrl.stream;
   }
 
   Stream<List<SaleRecord>> streamTodaySales() {
-    if (useCloud) return _salesCtrl.stream;
-    Future.microtask(() => _salesCtrl.add(_localSales.where((s) => !s.isClosed).toList()));
+    Future.microtask(
+        () => _salesCtrl.add(_localSales.where((s) => !s.isClosed).toList()));
     return _salesCtrl.stream;
   }
 
   Stream<List<ClosedDaySummary>> streamClosedDays() {
-    if (useCloud) return _closedDaysCtrl.stream;
     Future.microtask(() => _closedDaysCtrl.add(List.from(_localClosedDays)));
     return _closedDaysCtrl.stream;
   }
 
   Stream<List<AuditLog>> streamAuditLogs() {
-    if (useCloud) {
-      return _db!.collection('audit_logs').orderBy('timestamp', descending: true).limit(100).snapshots().map((s) => s.docs.map(AuditLog.fromDoc).toList());
-    }
     Future.microtask(() => _logsCtrl.add(List.from(_localLogs)));
     return _logsCtrl.stream;
   }
 
-  Future<void> addNewTable({required String name, required String type, required double hourlyRate}) async {
+  Future<void> addNewTable(
+      {required String name,
+      required String type,
+      required double hourlyRate}) async {
     final newId = const Uuid().v4();
     final table = GamingTable(
-      id: newId,
-      name: name,
-      hourlyRate: hourlyRate,
-      type: type,
-      status: 'idle',
-      accumulatedSeconds: 0,
-      attachedItems: [],
-    );
+        id: newId,
+        name: name,
+        hourlyRate: hourlyRate,
+        type: type,
+        status: 'idle',
+        accumulatedSeconds: 0,
+        attachedItems: []);
+    _localTables.add(table);
+    _saveAndEmitLocal();
 
     if (useCloud) {
-      await _db!.collection('tables').doc(newId).set(table.toMap());
-    } else {
-      _localTables.add(table);
-      _saveAndEmitLocal();
+      try {
+        await _db!.collection('tables').doc(newId).set(table.toMap());
+      } catch (_) {}
     }
     await _recordAudit(
-      title: 'إضافة ترابيزة جديدة',
-      message: 'تم إضافة ترابيزة جديدة باسم [$name]',
-      beforeVal: 'غير موجودة',
-      afterVal: 'متاحة',
-    );
+        title: 'إضافة ترابيزة',
+        message: 'تم إضافة ترابيزة [$name]',
+        beforeVal: 'غير موجودة',
+        afterVal: 'متاحة');
   }
 
-  // حذف الترابيزة نهائياً
   Future<void> deleteTable(GamingTable table) async {
+    _localTables.removeWhere((t) => t.id == table.id);
+    _saveAndEmitLocal();
+
     if (useCloud) {
-      await _db!.collection('tables').doc(table.id).delete();
-    } else {
-      _localTables.removeWhere((t) => t.id == table.id);
-      _saveAndEmitLocal();
+      try {
+        await _db!.collection('tables').doc(table.id).delete();
+      } catch (_) {}
     }
     await _recordAudit(
-      title: 'حذف ترابيزة',
-      message: 'تم حذف الترابيزة [${table.name}] نهائياً',
-      beforeVal: 'موجودة',
-      afterVal: 'محذوفة',
-    );
+        title: 'حذف ترابيزة',
+        message: 'تم حذف ترابيزة [${table.name}]',
+        beforeVal: 'موجودة',
+        afterVal: 'محذوفة');
   }
 
-  // تعديل بيانات الترابيزة (الاسم، النوع، سعر الساعة)
-  Future<void> updateTableDetails(GamingTable table, String newName, String newType, double newRate) async {
-    if (useCloud) {
-      await _db!.collection('tables').doc(table.id).update({
-        'name': newName,
-        'type': newType,
-        'hourlyRate': newRate,
-      });
-    } else {
-      final idx = _localTables.indexWhere((t) => t.id == table.id);
-      if (idx >= 0) {
-        _localTables[idx] = GamingTable(
+  Future<void> updateTableDetails(GamingTable table, String newName,
+      String newType, double newRate) async {
+    final idx = _localTables.indexWhere((t) => t.id == table.id);
+    if (idx >= 0) {
+      _localTables[idx] = GamingTable(
           id: table.id,
           name: newName,
           hourlyRate: newRate,
@@ -793,52 +983,53 @@ class FirestoreService {
           lastStartTime: table.lastStartTime,
           accumulatedSeconds: table.accumulatedSeconds,
           attachedItems: table.attachedItems,
-          guestNotes: table.guestNotes,
-        );
-        _saveAndEmitLocal();
-      }
+          guestNotes: table.guestNotes);
+      _saveAndEmitLocal();
+    }
+    if (useCloud) {
+      try {
+        await _db!.collection('tables').doc(table.id).update(
+            {'name': newName, 'type': newType, 'hourlyRate': newRate});
+      } catch (_) {}
     }
   }
 
   Future<void> startTableTimer(GamingTable table) async {
     if (table.type == 'normal') return;
-    if (useCloud) {
-      await _db!.collection('tables').doc(table.id).update({
-        'status': 'running',
-        'lastStartTime': Timestamp.fromDate(DateTime.now()),
-      });
-    } else {
-      final idx = _localTables.indexWhere((t) => t.id == table.id);
-      if (idx >= 0) {
-        _localTables[idx] = GamingTable(
+    final now = DateTime.now();
+    final idx = _localTables.indexWhere((t) => t.id == table.id);
+    if (idx >= 0) {
+      _localTables[idx] = GamingTable(
           id: table.id,
           name: table.name,
           hourlyRate: table.hourlyRate,
           type: table.type,
           status: 'running',
-          lastStartTime: DateTime.now(),
+          lastStartTime: now,
           accumulatedSeconds: table.accumulatedSeconds,
           attachedItems: table.attachedItems,
-          guestNotes: table.guestNotes,
-        );
-        _saveAndEmitLocal();
-      }
+          guestNotes: table.guestNotes);
+      _saveAndEmitLocal();
     }
+    if (useCloud) {
+      try {
+        await _db!.collection('tables').doc(table.id).update(
+            {'status': 'running', 'lastStartTime': Timestamp.fromDate(now)});
+      } catch (_) {}
+    }
+    await _recordAudit(
+        title: 'تشغيل وقت: ${table.name}',
+        message: 'تم بدء الوقت على ${table.name}',
+        beforeVal: 'متوقفة',
+        afterVal: 'شغالة الآن');
   }
 
   Future<void> pauseTableTimer(GamingTable table) async {
     if (table.type == 'normal') return;
     final totalElapsed = table.currentElapsedSeconds;
-    if (useCloud) {
-      await _db!.collection('tables').doc(table.id).update({
-        'status': 'paused',
-        'lastStartTime': null,
-        'accumulatedSeconds': totalElapsed,
-      });
-    } else {
-      final idx = _localTables.indexWhere((t) => t.id == table.id);
-      if (idx >= 0) {
-        _localTables[idx] = GamingTable(
+    final idx = _localTables.indexWhere((t) => t.id == table.id);
+    if (idx >= 0) {
+      _localTables[idx] = GamingTable(
           id: table.id,
           name: table.name,
           hourlyRate: table.hourlyRate,
@@ -847,22 +1038,24 @@ class FirestoreService {
           lastStartTime: null,
           accumulatedSeconds: totalElapsed,
           attachedItems: table.attachedItems,
-          guestNotes: table.guestNotes,
-        );
-        _saveAndEmitLocal();
-      }
+          guestNotes: table.guestNotes);
+      _saveAndEmitLocal();
+    }
+    if (useCloud) {
+      try {
+        await _db!.collection('tables').doc(table.id).update({
+          'status': 'paused',
+          'lastStartTime': null,
+          'accumulatedSeconds': totalElapsed
+        });
+      } catch (_) {}
     }
   }
 
   Future<void> updateTableGuestNotes(GamingTable table, String notes) async {
-    if (useCloud) {
-      await _db!.collection('tables').doc(table.id).update({
-        'guestNotes': notes,
-      });
-    } else {
-      final idx = _localTables.indexWhere((t) => t.id == table.id);
-      if (idx >= 0) {
-        _localTables[idx] = GamingTable(
+    final idx = _localTables.indexWhere((t) => t.id == table.id);
+    if (idx >= 0) {
+      _localTables[idx] = GamingTable(
           id: table.id,
           name: table.name,
           hourlyRate: table.hourlyRate,
@@ -871,22 +1064,24 @@ class FirestoreService {
           lastStartTime: table.lastStartTime,
           accumulatedSeconds: table.accumulatedSeconds,
           attachedItems: table.attachedItems,
-          guestNotes: notes,
-        );
-        _saveAndEmitLocal();
-      }
+          guestNotes: notes);
+      _saveAndEmitLocal();
+    }
+    if (useCloud) {
+      try {
+        await _db!
+            .collection('tables')
+            .doc(table.id)
+            .update({'guestNotes': notes});
+      } catch (_) {}
     }
   }
 
-  Future<void> updateTableAttachedItems(GamingTable table, List<AttachedItem> newItems) async {
-    if (useCloud) {
-      await _db!.collection('tables').doc(table.id).update({
-        'attachedItems': newItems.map((e) => e.toMap()).toList(),
-      });
-    } else {
-      final idx = _localTables.indexWhere((t) => t.id == table.id);
-      if (idx >= 0) {
-        _localTables[idx] = GamingTable(
+  Future<void> updateTableAttachedItems(
+      GamingTable table, List<AttachedItem> newItems) async {
+    final idx = _localTables.indexWhere((t) => t.id == table.id);
+    if (idx >= 0) {
+      _localTables[idx] = GamingTable(
           id: table.id,
           name: table.name,
           hourlyRate: table.hourlyRate,
@@ -895,64 +1090,61 @@ class FirestoreService {
           lastStartTime: table.lastStartTime,
           accumulatedSeconds: table.accumulatedSeconds,
           attachedItems: newItems,
-          guestNotes: table.guestNotes,
-        );
-        _saveAndEmitLocal();
-      }
+          guestNotes: table.guestNotes);
+      _saveAndEmitLocal();
+    }
+    if (useCloud) {
+      try {
+        await _db!.collection('tables').doc(table.id).update(
+            {'attachedItems': newItems.map((e) => e.toMap()).toList()});
+      } catch (_) {}
     }
   }
 
   Future<void> attachDrinksToTable(
       GamingTable table, Map<InventoryItem, int> selectedDrinks) async {
     final updatedList = List<AttachedItem>.from(table.attachedItems);
-
     for (final entry in selectedDrinks.entries) {
       final item = entry.key;
       final qty = entry.value;
       final newStock = (item.stock - qty).clamp(0, 999999);
 
-      if (useCloud) {
-        await _db!.collection('inventory').doc(item.id).update({'stock': newStock});
-      } else {
-        final iIdx = _localInv.indexWhere((i) => i.id == item.id);
-        if (iIdx >= 0) {
-          _localInv[iIdx] = InventoryItem(
+      final iIdx = _localInv.indexWhere((i) => i.id == item.id);
+      if (iIdx >= 0) {
+        _localInv[iIdx] = InventoryItem(
             id: item.id,
             name: item.name,
             price: item.price,
             stock: newStock,
-            lowStockThreshold: item.lowStockThreshold,
-          );
-        }
+            lowStockThreshold: item.lowStockThreshold);
+      }
+      if (useCloud) {
+        try {
+          await _db!
+              .collection('inventory')
+              .doc(item.id)
+              .update({'stock': newStock});
+        } catch (_) {}
       }
 
-      final existingIndex = updatedList.indexWhere((element) => element.itemId == item.id);
+      final existingIndex =
+          updatedList.indexWhere((element) => element.itemId == item.id);
       if (existingIndex >= 0) {
         final existing = updatedList[existingIndex];
         updatedList[existingIndex] = AttachedItem(
-          itemId: existing.itemId,
-          name: existing.name,
-          price: existing.price,
-          qty: existing.qty + qty,
-        );
+            itemId: existing.itemId,
+            name: existing.name,
+            price: existing.price,
+            qty: existing.qty + qty);
       } else {
         updatedList.add(AttachedItem(
-          itemId: item.id,
-          name: item.name,
-          price: item.price,
-          qty: qty,
-        ));
+            itemId: item.id, name: item.name, price: item.price, qty: qty));
       }
     }
 
-    if (useCloud) {
-      await _db!.collection('tables').doc(table.id).update({
-        'attachedItems': updatedList.map((e) => e.toMap()).toList(),
-      });
-    } else {
-      final tIdx = _localTables.indexWhere((t) => t.id == table.id);
-      if (tIdx >= 0) {
-        _localTables[tIdx] = GamingTable(
+    final tIdx = _localTables.indexWhere((t) => t.id == table.id);
+    if (tIdx >= 0) {
+      _localTables[tIdx] = GamingTable(
           id: table.id,
           name: table.name,
           hourlyRate: table.hourlyRate,
@@ -961,10 +1153,15 @@ class FirestoreService {
           lastStartTime: table.lastStartTime,
           accumulatedSeconds: table.accumulatedSeconds,
           attachedItems: updatedList,
-          guestNotes: table.guestNotes,
-        );
-      }
-      _saveAndEmitLocal();
+          guestNotes: table.guestNotes);
+    }
+    _saveAndEmitLocal();
+
+    if (useCloud) {
+      try {
+        await _db!.collection('tables').doc(table.id).update(
+            {'attachedItems': updatedList.map((e) => e.toMap()).toList()});
+      } catch (_) {}
     }
   }
 
@@ -976,7 +1173,7 @@ class FirestoreService {
 
     final sale = SaleRecord(
       id: const Uuid().v4(),
-      type: table.type == 'normal' ? 'normal_table_checkout' : 'gaming_checkout',
+      type: table.type == 'normal' ? 'normal_checkout' : 'gaming_checkout',
       timeRevenue: timeCost,
       drinksRevenue: drinksCost,
       totalRevenue: total,
@@ -986,20 +1183,10 @@ class FirestoreService {
       isClosed: false,
     );
 
-    if (useCloud) {
-      await _db!.collection('sales').add(sale.toMap());
-      await _db!.collection('tables').doc(table.id).update({
-        'status': 'idle',
-        'lastStartTime': null,
-        'accumulatedSeconds': 0,
-        'attachedItems': [],
-        'guestNotes': '',
-      });
-    } else {
-      _localSales.insert(0, sale);
-      final idx = _localTables.indexWhere((t) => t.id == table.id);
-      if (idx >= 0) {
-        _localTables[idx] = GamingTable(
+    _localSales.insert(0, sale);
+    final idx = _localTables.indexWhere((t) => t.id == table.id);
+    if (idx >= 0) {
+      _localTables[idx] = GamingTable(
           id: table.id,
           name: table.name,
           hourlyRate: table.hourlyRate,
@@ -1008,111 +1195,97 @@ class FirestoreService {
           lastStartTime: null,
           accumulatedSeconds: 0,
           attachedItems: [],
-          guestNotes: '',
-        );
-      }
-      _saveAndEmitLocal();
+          guestNotes: '');
     }
+    _saveAndEmitLocal();
 
+    if (useCloud) {
+      try {
+        await _db!.collection('sales').add(sale.toMap());
+        await _db!.collection('tables').doc(table.id).update({
+          'status': 'idle',
+          'lastStartTime': null,
+          'accumulatedSeconds': 0,
+          'attachedItems': [],
+          'guestNotes': ''
+        });
+      } catch (_) {}
+    }
     await _recordAudit(
-      title: 'حساب ترابيزة: ${table.name}',
-      message: 'تم إنهاء وحساب ${table.name} بإجمالي ${total.toStringAsFixed(1)} ج.م',
-      beforeVal: 'مفتوحة (Hold)',
-      afterVal: 'تم التحصيل والتصفير',
-    );
-
+        title: 'حساب ترابيزة',
+        message: 'حساب ${table.name} بمبلغ ${total.toStringAsFixed(1)} ج.م',
+        beforeVal: 'Hold',
+        afterVal: 'تم التحصيل');
     return sale;
   }
 
   Future<void> checkoutDirectPos(Map<InventoryItem, int> cart) async {
     double totalDrinks = 0;
     final List<AttachedItem> soldItems = [];
-
     for (final entry in cart.entries) {
       final item = entry.key;
       final qty = entry.value;
       totalDrinks += item.price * qty;
-
       soldItems.add(AttachedItem(
-        itemId: item.id,
-        name: item.name,
-        price: item.price,
-        qty: qty,
-      ));
-
+          itemId: item.id, name: item.name, price: item.price, qty: qty));
       final newStock = (item.stock - qty).clamp(0, 999999);
-      if (useCloud) {
-        await _db!.collection('inventory').doc(item.id).update({'stock': newStock});
-      } else {
-        final idx = _localInv.indexWhere((i) => i.id == item.id);
-        if (idx >= 0) {
-          _localInv[idx] = InventoryItem(
+
+      final idx = _localInv.indexWhere((i) => i.id == item.id);
+      if (idx >= 0) {
+        _localInv[idx] = InventoryItem(
             id: item.id,
             name: item.name,
             price: item.price,
             stock: newStock,
-            lowStockThreshold: item.lowStockThreshold,
-          );
-        }
+            lowStockThreshold: item.lowStockThreshold);
+      }
+      if (useCloud) {
+        try {
+          await _db!
+              .collection('inventory')
+              .doc(item.id)
+              .update({'stock': newStock});
+        } catch (_) {}
       }
     }
 
     final sale = SaleRecord(
-      id: const Uuid().v4(),
-      type: 'drinks_only',
-      timeRevenue: 0,
-      drinksRevenue: totalDrinks,
-      totalRevenue: totalDrinks,
-      playedSeconds: 0,
-      soldItems: soldItems,
-      timestamp: DateTime.now(),
-      isClosed: false,
-    );
+        id: const Uuid().v4(),
+        type: 'drinks_only',
+        timeRevenue: 0,
+        drinksRevenue: totalDrinks,
+        totalRevenue: totalDrinks,
+        playedSeconds: 0,
+        soldItems: soldItems,
+        timestamp: DateTime.now(),
+        isClosed: false);
+    _localSales.insert(0, sale);
+    _saveAndEmitLocal();
 
     if (useCloud) {
-      await _db!.collection('sales').add(sale.toMap());
-    } else {
-      _localSales.insert(0, sale);
-      _saveAndEmitLocal();
+      try {
+        await _db!.collection('sales').add(sale.toMap());
+      } catch (_) {}
     }
   }
 
-  Future<void> closeCurrentDayAndReset({
-    required double drinksRev,
-    required double tableRev,
-    required double grandTotal,
-  }) async {
+  Future<void> closeCurrentDayAndReset(
+      {required double drinksRev,
+      required double tableRev,
+      required double grandTotal}) async {
     final now = DateTime.now();
-    final dateStr = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
+    final dateStr =
+        '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
 
     double extraTableRev = 0;
     double extraDrinks = 0;
 
-    if (useCloud) {
-      final tablesSnap = await _db!.collection('tables').get();
-      for (final doc in tablesSnap.docs) {
-        final t = GamingTable.fromDoc(doc);
-        if (t.currentElapsedSeconds > 0 || t.attachedItems.isNotEmpty) {
-          extraTableRev += t.currentTimeCost;
-          extraDrinks += t.attachedDrinksCost;
-
-          await doc.reference.update({
-            'status': 'idle',
-            'lastStartTime': null,
-            'accumulatedSeconds': 0,
-            'attachedItems': [],
-            'guestNotes': '',
-          });
-        }
-      }
-    } else {
-      for (int i = 0; i < _localTables.length; i++) {
-        final t = _localTables[i];
-        if (t.currentElapsedSeconds > 0 || t.attachedItems.isNotEmpty) {
-          extraTableRev += t.currentTimeCost;
-          extraDrinks += t.attachedDrinksCost;
-
-          _localTables[i] = GamingTable(
+    for (int i = 0; i < _localTables.length; i++) {
+      final t = _localTables[i];
+      if (t.currentElapsedSeconds > 0 || t.attachedItems.isNotEmpty) {
+        extraTableRev += t.currentTimeCost;
+        extraDrinks += t.attachedDrinksCost;
+        _localTables[i] = GamingTable(
             id: t.id,
             name: t.name,
             hourlyRate: t.hourlyRate,
@@ -1121,9 +1294,7 @@ class FirestoreService {
             lastStartTime: null,
             accumulatedSeconds: 0,
             attachedItems: [],
-            guestNotes: '',
-          );
-        }
+            guestNotes: '');
       }
     }
 
@@ -1135,96 +1306,117 @@ class FirestoreService {
       id: const Uuid().v4(),
       dateLabel: dateStr,
       drinksRevenue: finalDrinks,
-      billiardRevenue: finalTables,
-      pingPongRevenue: 0.0,
+      tablesRevenue: finalTables,
       grandTotal: finalGrandTotal,
       closedAt: now,
     );
 
-    if (useCloud) {
-      if (finalGrandTotal > 0) {
-        await _db!.collection('closed_days').add(summary.toMap());
-      }
-      final allSalesSnap = await _db!.collection('sales').get();
-      for (final doc in allSalesSnap.docs) {
-        await doc.reference.delete();
-      }
-    } else {
-      if (finalGrandTotal > 0) {
-        _localClosedDays.insert(0, summary);
-      }
-      _localSales.clear();
-      _saveAndEmitLocal();
+    if (finalGrandTotal > 0) {
+      _localClosedDays.insert(0, summary);
     }
+    _localSales.clear();
+    _saveAndEmitLocal();
+
+    if (useCloud) {
+      try {
+        if (finalGrandTotal > 0) {
+          await _db!.collection('closed_days').add(summary.toMap());
+        }
+        final tablesSnap = await _db!.collection('tables').get();
+        for (final doc in tablesSnap.docs) {
+          await doc.reference.update({
+            'status': 'idle',
+            'lastStartTime': null,
+            'accumulatedSeconds': 0,
+            'attachedItems': [],
+            'guestNotes': ''
+          });
+        }
+        final allSalesSnap = await _db!.collection('sales').get();
+        for (final doc in allSalesSnap.docs) {
+          await doc.reference.delete();
+        }
+      } catch (_) {}
+    }
+
+    await _recordAudit(
+        title: 'تقفيل اليوم - Joker Cafe',
+        message:
+            'تم تقفيل حسابات يوم $dateStr بإجمالي ${finalGrandTotal.toStringAsFixed(1)} ج.م',
+        beforeVal: '${finalGrandTotal.toStringAsFixed(1)} ج.م',
+        afterVal: '0.0 ج.م (شيفت جديد)');
   }
 
-  Future<void> addNewInventoryItem({
-    required String name,
-    required double price,
-    required int stock,
-    required int threshold,
-  }) async {
-    if (useCloud) {
-      await _db!.collection('inventory').add({
-        'name': name,
-        'price': price,
-        'stock': stock,
-        'lowStockThreshold': threshold,
-      });
-    } else {
-      _localInv.add(InventoryItem(
+  Future<void> addNewInventoryItem(
+      {required String name,
+      required double price,
+      required int stock,
+      required int threshold}) async {
+    final newItem = InventoryItem(
         id: const Uuid().v4(),
         name: name,
         price: price,
         stock: stock,
-        lowStockThreshold: threshold,
-      ));
-      _saveAndEmitLocal();
+        lowStockThreshold: threshold);
+    _localInv.add(newItem);
+    _saveAndEmitLocal();
+
+    if (useCloud) {
+      try {
+        await _db!.collection('inventory').doc(newItem.id).set(newItem.toMap());
+      } catch (_) {}
     }
   }
 
   Future<void> updateItemPrice(InventoryItem item, double newPrice) async {
-    if (useCloud) {
-      await _db!.collection('inventory').doc(item.id).update({'price': newPrice});
-    } else {
-      final idx = _localInv.indexWhere((i) => i.id == item.id);
-      if (idx >= 0) {
-        _localInv[idx] = InventoryItem(
+    final idx = _localInv.indexWhere((i) => i.id == item.id);
+    if (idx >= 0) {
+      _localInv[idx] = InventoryItem(
           id: item.id,
           name: item.name,
           price: newPrice,
           stock: item.stock,
-          lowStockThreshold: item.lowStockThreshold,
-        );
-        _saveAndEmitLocal();
-      }
+          lowStockThreshold: item.lowStockThreshold);
+      _saveAndEmitLocal();
+    }
+    if (useCloud) {
+      try {
+        await _db!
+            .collection('inventory')
+            .doc(item.id)
+            .update({'price': newPrice});
+      } catch (_) {}
     }
   }
 
   Future<void> updateItemStock(InventoryItem item, int newStock) async {
-    if (useCloud) {
-      await _db!.collection('inventory').doc(item.id).update({'stock': newStock});
-    } else {
-      final idx = _localInv.indexWhere((i) => i.id == item.id);
-      if (idx >= 0) {
-        _localInv[idx] = InventoryItem(
+    final idx = _localInv.indexWhere((i) => i.id == item.id);
+    if (idx >= 0) {
+      _localInv[idx] = InventoryItem(
           id: item.id,
           name: item.name,
           price: item.price,
           stock: newStock,
-          lowStockThreshold: item.lowStockThreshold,
-        );
-        _saveAndEmitLocal();
-      }
+          lowStockThreshold: item.lowStockThreshold);
+      _saveAndEmitLocal();
+    }
+    if (useCloud) {
+      try {
+        await _db!
+            .collection('inventory')
+            .doc(item.id)
+            .update({'stock': newStock});
+      } catch (_) {}
     }
   }
 
   Future<void> deleteInventoryItem(InventoryItem item) async {
+    _localInv.removeWhere((i) => i.id == item.id);
+    _saveAndEmitLocal();
     if (useCloud) {
-      await _db!.collection('inventory').doc(item.id).delete();
-    } else {
-      _localInv.removeWhere((i) => i.id == item.id);
-      _saveAndEmitLocal();
+      try {
+        await _db!.collection('inventory').doc(item.id).delete();
+      } catch (_) {}
     }
   }
 }
@@ -1343,7 +1535,8 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                     final sales = salesSnap.data ?? [];
                     final logs = logsSnap.data ?? [];
 
-                    final todayTotal = sales.fold<double>(0.0, (sum, s) => sum + s.totalRevenue);
+                    final todayTotal = sales.fold<double>(
+                        0.0, (sum, s) => sum + s.totalRevenue);
 
                     return LayoutBuilder(
                       builder: (context, constraints) {
@@ -1354,40 +1547,61 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                             backgroundColor: const Color(0xFF181E2C),
                             title: Row(
                               children: [
-                                const Icon(Icons.theater_comedy, color: Color(0xFF00C896)),
+                                const Icon(Icons.theater_comedy,
+                                    color: Color(0xFF00C896)),
                                 const SizedBox(width: 10),
                                 const Expanded(
-                                  child: Text('Joker Cafe - لوحة التحكم (مزامنة حية)', style: TextStyle(fontWeight: FontWeight.bold)),
+                                  child: Text(
+                                      'Joker Cafe - لوحة التحكم (مزامنة حية)',
+                                      style: TextStyle(
+                                          fontWeight: FontWeight.bold)),
                                 ),
                                 Container(
-                                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                                  padding: const EdgeInsets.symmetric(
+                                      horizontal: 12, vertical: 6),
                                   decoration: BoxDecoration(
                                     color: Colors.teal.withValues(alpha: 0.2),
                                     borderRadius: BorderRadius.circular(12),
-                                    border: Border.all(color: const Color(0xFF00C896)),
+                                    border: Border.all(
+                                        color: const Color(0xFF00C896)),
                                   ),
                                   child: Text(
                                     'إجمالي الشيفت: ${todayTotal.toStringAsFixed(1)} ج.م',
-                                    style: const TextStyle(fontWeight: FontWeight.bold, color: Color(0xFF00C896)),
+                                    style: const TextStyle(
+                                        fontWeight: FontWeight.bold,
+                                        color: Color(0xFF00C896)),
                                   ),
                                 ),
                               ],
                             ),
                           ),
                           body: isWideDesktop
-                              ? _buildWindowsDesktopView(tables, inventory, sales, logs)
-                              : _buildAndroidMobileView(tables, inventory, sales, logs),
+                              ? _buildWindowsDesktopView(
+                                  tables, inventory, sales, logs)
+                              : _buildAndroidMobileView(
+                                  tables, inventory, sales, logs),
                           bottomNavigationBar: isWideDesktop
                               ? null
                               : NavigationBar(
                                   selectedIndex: _selectedIndex,
-                                  onDestinationSelected: (idx) => setState(() => _selectedIndex = idx),
+                                  onDestinationSelected: (idx) =>
+                                      setState(() => _selectedIndex = idx),
                                   destinations: const [
-                                    NavigationDestination(icon: Icon(Icons.table_bar), label: 'الترابيزات'),
-                                    NavigationDestination(icon: Icon(Icons.point_of_sale), label: 'الكاشير'),
-                                    NavigationDestination(icon: Icon(Icons.inventory_2), label: 'المخزن'),
-                                    NavigationDestination(icon: Icon(Icons.bar_chart), label: 'تقفيل اليوم'),
-                                    NavigationDestination(icon: Icon(Icons.history), label: 'التعديلات'),
+                                    NavigationDestination(
+                                        icon: Icon(Icons.table_bar),
+                                        label: 'الترابيزات'),
+                                    NavigationDestination(
+                                        icon: Icon(Icons.point_of_sale),
+                                        label: 'الكاشير'),
+                                    NavigationDestination(
+                                        icon: Icon(Icons.inventory_2),
+                                        label: 'المخزن'),
+                                    NavigationDestination(
+                                        icon: Icon(Icons.bar_chart),
+                                        label: 'تقفيل اليوم'),
+                                    NavigationDestination(
+                                        icon: Icon(Icons.history),
+                                        label: 'التعديلات'),
                                   ],
                                 ),
                         );
@@ -1404,12 +1618,11 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
   }
 
   Widget _buildWindowsDesktopView(
-    List<GamingTable> tables,
-    List<InventoryItem> inventory,
-    List<SaleRecord> sales,
-    List<AuditLog> logs,
-  ) {
-    final desktopIndex = _selectedIndex > 3 ? 0 : _selectedIndex;
+      List<GamingTable> tables,
+      List<InventoryItem> inventory,
+      List<SaleRecord> sales,
+      List<AuditLog> logs) {
+    final desktopIndex = _selectedIndex > 4 ? 0 : _selectedIndex;
     return Row(
       children: [
         NavigationRail(
@@ -1418,10 +1631,18 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
           extended: true,
           backgroundColor: const Color(0xFF181E2C),
           destinations: const [
-            NavigationRailDestination(icon: Icon(Icons.dashboard_customize), label: Text('الترابيزات والكاشير')),
-            NavigationRailDestination(icon: Icon(Icons.inventory_2), label: Text('إدارة المخزن')),
-            NavigationRailDestination(icon: Icon(Icons.assessment), label: Text('التقارير وتقفيل اليوم')),
-            NavigationRailDestination(icon: Icon(Icons.history), label: Text('سجل العمليات')),
+            NavigationRailDestination(
+                icon: Icon(Icons.dashboard_customize),
+                label: Text('الترابيزات')),
+            NavigationRailDestination(
+                icon: Icon(Icons.point_of_sale), label: Text('الكاشير')),
+            NavigationRailDestination(
+                icon: Icon(Icons.inventory_2), label: Text('المخزن')),
+            NavigationRailDestination(
+                icon: Icon(Icons.assessment),
+                label: Text('تقفيل اليوم والتقارير')),
+            NavigationRailDestination(
+                icon: Icon(Icons.history), label: Text('سجل العمليات')),
           ],
         ),
         const VerticalDivider(width: 1),
@@ -1433,16 +1654,21 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                   return Row(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Expanded(flex: 5, child: _buildTablesSection(tables, inventory)),
+                      Expanded(
+                          flex: 5,
+                          child: _buildTablesSection(tables, inventory)),
                       const VerticalDivider(width: 1),
-                      Expanded(flex: 5, child: _buildPosSection(inventory, tables)),
+                      Expanded(
+                          flex: 5, child: _buildPosSection(inventory, tables)),
                     ],
                   );
                 case 1:
-                  return _buildInventorySection(inventory);
+                  return _buildPosSection(inventory, tables);
                 case 2:
-                  return _buildReportsSection(sales, logs);
+                  return _buildInventorySection(inventory);
                 case 3:
+                  return _buildReportsSection(sales, logs);
+                case 4:
                   return _buildAuditLogsSection(logs);
                 default:
                   return const SizedBox.shrink();
@@ -1455,11 +1681,10 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
   }
 
   Widget _buildAndroidMobileView(
-    List<GamingTable> tables,
-    List<InventoryItem> inventory,
-    List<SaleRecord> sales,
-    List<AuditLog> logs,
-  ) {
+      List<GamingTable> tables,
+      List<InventoryItem> inventory,
+      List<SaleRecord> sales,
+      List<AuditLog> logs) {
     switch (_selectedIndex) {
       case 0:
         return _buildTablesSection(tables, inventory);
@@ -1476,16 +1701,20 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
     }
   }
 
-  Widget _buildTablesSection(List<GamingTable> tables, List<InventoryItem> inventory) {
+  Widget _buildTablesSection(
+      List<GamingTable> tables, List<InventoryItem> inventory) {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
         Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
-            const Text('إدارة الترابيزات (مزامنة حية)', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            const Text('إدارة الترابيزات (مزامنة حية)',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
             ElevatedButton.icon(
-              style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF00C896), foregroundColor: Colors.black),
+              style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF00C896),
+                  foregroundColor: Colors.black),
               onPressed: _showAddTableDialog,
               icon: const Icon(Icons.add),
               label: const Text('إضافة ترابيزة'),
@@ -1501,7 +1730,9 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
   Widget _buildTableCard(GamingTable table, List<InventoryItem> inventory) {
     final isNormal = table.type == 'normal';
     final isRunning = table.status == 'running';
-    final statusColor = isNormal ? Colors.purpleAccent : (isRunning ? const Color(0xFF00C896) : Colors.grey);
+    final statusColor = isNormal
+        ? Colors.purpleAccent
+        : (isRunning ? const Color(0xFF00C896) : Colors.grey);
 
     return Card(
       margin: const EdgeInsets.only(bottom: 16),
@@ -1519,27 +1750,36 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
               children: [
                 Row(
                   children: [
-                    Icon(isNormal ? Icons.table_restaurant : Icons.sports_esports, color: statusColor, size: 26),
+                    Icon(
+                        isNormal
+                            ? Icons.table_restaurant
+                            : Icons.sports_esports,
+                        color: statusColor,
+                        size: 26),
                     const SizedBox(width: 10),
-                    Text(table.name, style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                    Text(table.name,
+                        style: const TextStyle(
+                            fontSize: 18, fontWeight: FontWeight.bold)),
                   ],
                 ),
                 Row(
                   children: [
                     Chip(
-                      label: Text(isNormal ? 'ترابيزة عادية' : 'ساعة: ${table.hourlyRate.toStringAsFixed(0)} ج.م'),
+                      label: Text(isNormal
+                          ? 'ترابيزة عادية'
+                          : 'ساعة: ${table.hourlyRate.toStringAsFixed(0)} ج.م'),
                       backgroundColor: statusColor.withValues(alpha: 0.2),
                     ),
                     const SizedBox(width: 6),
-                    // زر تعديل الترابيزة
                     IconButton(
-                      icon: const Icon(Icons.edit, size: 20, color: Colors.blueAccent),
+                      icon: const Icon(Icons.edit,
+                          size: 20, color: Colors.blueAccent),
                       tooltip: 'تعديل بيانات الترابيزة',
                       onPressed: () => _showEditTableDialog(table),
                     ),
-                    // زر حذف الترابيزة
                     IconButton(
-                      icon: const Icon(Icons.delete_outline, size: 20, color: Colors.redAccent),
+                      icon: const Icon(Icons.delete_outline,
+                          size: 20, color: Colors.redAccent),
                       tooltip: 'حذف الترابيزة',
                       onPressed: () => _confirmDeleteTable(table),
                     ),
@@ -1551,22 +1791,37 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceAround,
               children: [
-                if (!isNormal) _metricColumn('الوقت', table.formattedDuration, statusColor),
-                if (!isNormal) _metricColumn('حساب الوقت', '${table.currentTimeCost.toStringAsFixed(1)} ج.م', Colors.white),
-                _metricColumn('حساب المشاريب (Hold)', '${table.attachedDrinksCost.toStringAsFixed(1)} ج.م', Colors.amber),
-                _metricColumn('الإجمالي', '${table.grandTotal.toStringAsFixed(1)} ج.م', const Color(0xFF00C896)),
+                if (!isNormal)
+                  _metricColumn('الوقت', table.formattedDuration, statusColor),
+                if (!isNormal)
+                  _metricColumn(
+                      'حساب الوقت',
+                      '${table.currentTimeCost.toStringAsFixed(1)} ج.م',
+                      Colors.white),
+                _metricColumn(
+                    'حساب المشاريب (Hold)',
+                    '${table.attachedDrinksCost.toStringAsFixed(1)} ج.م',
+                    Colors.amber),
+                _metricColumn(
+                    'الإجمالي',
+                    '${table.grandTotal.toStringAsFixed(1)} ج.م',
+                    const Color(0xFF00C896)),
               ],
             ),
             const SizedBox(height: 12),
             TextField(
+              key: ValueKey('notes_${table.id}'),
               controller: TextEditingController(text: table.guestNotes)
-                ..selection = TextSelection.fromPosition(TextPosition(offset: table.guestNotes.length)),
+                ..selection = TextSelection.fromPosition(
+                    TextPosition(offset: table.guestNotes.length)),
               onChanged: (val) => widget.db.updateTableGuestNotes(table, val),
               decoration: InputDecoration(
-                labelText: 'أسماء الأشخاص / الملاحظات (متزامن بين اللاب والموبايل)',
+                labelText:
+                    'أسماء الأشخاص / الملاحظات (متزامن بين اللاب والموبايل)',
                 hintText: 'اكتب أسماء الأشخاص...',
                 prefixIcon: const Icon(Icons.person, color: Color(0xFF00C896)),
-                border: OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
+                border:
+                    OutlineInputBorder(borderRadius: BorderRadius.circular(10)),
                 filled: true,
                 fillColor: Colors.black26,
               ),
@@ -1576,12 +1831,17 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
               const SizedBox(height: 10),
               Wrap(
                 spacing: 8,
-                children: table.attachedItems.map((item) => ActionChip(
-                  avatar: const Icon(Icons.edit, size: 14),
-                  label: Text('${item.name} × ${item.qty} (${item.total.toStringAsFixed(0)} ج.م)'),
-                  backgroundColor: Colors.amber.shade900.withValues(alpha: 0.4),
-                  onPressed: () => _showEditTableItemsDialog(table, inventory),
-                )).toList(),
+                children: table.attachedItems
+                    .map((item) => ActionChip(
+                          avatar: const Icon(Icons.edit, size: 14),
+                          label: Text(
+                              '${item.name} × ${item.qty} (${item.total.toStringAsFixed(0)} ج.م)'),
+                          backgroundColor:
+                              Colors.amber.shade900.withValues(alpha: 0.4),
+                          onPressed: () =>
+                              _showEditTableItemsDialog(table, inventory),
+                        ))
+                    .toList(),
               ),
             ],
             const SizedBox(height: 14),
@@ -1591,14 +1851,20 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
               children: [
                 if (!isNormal) ...[
                   ElevatedButton.icon(
-                    style: ElevatedButton.styleFrom(backgroundColor: const Color(0xFF00C896), foregroundColor: Colors.black),
-                    onPressed: isRunning ? null : () => widget.db.startTableTimer(table),
+                    style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF00C896),
+                        foregroundColor: Colors.black),
+                    onPressed:
+                        isRunning ? null : () => widget.db.startTableTimer(table),
                     icon: const Icon(Icons.play_arrow),
                     label: const Text('تشغيل'),
                   ),
                   ElevatedButton.icon(
-                    style: ElevatedButton.styleFrom(backgroundColor: Colors.amber.shade700, foregroundColor: Colors.black),
-                    onPressed: isRunning ? () => widget.db.pauseTableTimer(table) : null,
+                    style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.amber.shade700,
+                        foregroundColor: Colors.black),
+                    onPressed:
+                        isRunning ? () => widget.db.pauseTableTimer(table) : null,
                     icon: const Icon(Icons.pause),
                     label: const Text('إيقاف'),
                   ),
@@ -1610,14 +1876,19 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                 ),
                 if (table.attachedItems.isNotEmpty)
                   OutlinedButton.icon(
-                    style: OutlinedButton.styleFrom(foregroundColor: Colors.orangeAccent),
-                    onPressed: () => _showEditTableItemsDialog(table, inventory),
+                    style: OutlinedButton.styleFrom(
+                        foregroundColor: Colors.orangeAccent),
+                    onPressed: () =>
+                        _showEditTableItemsDialog(table, inventory),
                     icon: const Icon(Icons.edit_note),
                     label: const Text('تعديل الطلبات'),
                   ),
                 ElevatedButton.icon(
-                  style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent, foregroundColor: Colors.white),
-                  onPressed: (table.currentElapsedSeconds > 0 || table.attachedItems.isNotEmpty)
+                  style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.redAccent,
+                      foregroundColor: Colors.white),
+                  onPressed: (table.currentElapsedSeconds > 0 ||
+                          table.attachedItems.isNotEmpty)
                       ? () => _confirmTableCheckout(table)
                       : null,
                   icon: const Icon(Icons.receipt),
@@ -1634,14 +1905,18 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
   Widget _metricColumn(String label, String value, Color color) {
     return Column(
       children: [
-        Text(label, style: const TextStyle(fontSize: 11, color: Colors.white70)),
+        Text(label,
+            style: const TextStyle(fontSize: 11, color: Colors.white70)),
         const SizedBox(height: 2),
-        Text(value, style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: color)),
+        Text(value,
+            style: TextStyle(
+                fontSize: 15, fontWeight: FontWeight.bold, color: color)),
       ],
     );
   }
 
-  Widget _buildPosSection(List<InventoryItem> inventory, List<GamingTable> tables) {
+  Widget _buildPosSection(
+      List<InventoryItem> inventory, List<GamingTable> tables) {
     double cartTotal = 0;
     final Map<InventoryItem, int> resolvedCart = {};
     for (final item in inventory) {
@@ -1657,7 +1932,8 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text('الكاشير والمشاريب', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          const Text('الكاشير والمشاريب',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
           const SizedBox(height: 12),
           Expanded(
             child: GridView.builder(
@@ -1673,22 +1949,38 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                 final qtyInCart = _posCart[item.id] ?? 0;
 
                 return InkWell(
-                  onTap: item.stock > qtyInCart ? () => setState(() => _posCart[item.id] = qtyInCart + 1) : null,
+                  onTap: item.stock > qtyInCart
+                      ? () => setState(() => _posCart[item.id] = qtyInCart + 1)
+                      : null,
                   child: Card(
                     shape: RoundedRectangleBorder(
                       borderRadius: BorderRadius.circular(12),
-                      side: BorderSide(color: qtyInCart > 0 ? const Color(0xFF00C896) : Colors.white12, width: 2),
+                      side: BorderSide(
+                          color: qtyInCart > 0
+                              ? const Color(0xFF00C896)
+                              : Colors.white12,
+                          width: 2),
                     ),
                     child: Padding(
                       padding: const EdgeInsets.all(10),
                       child: Column(
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
-                          Text('مخزن: ${item.stock}', style: const TextStyle(fontSize: 10, color: Colors.white60)),
-                          Text(item.name, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-                          Text('${item.price} ج.م', style: const TextStyle(color: Color(0xFF00C896), fontWeight: FontWeight.bold)),
+                          Text('مخزن: ${item.stock}',
+                              style: const TextStyle(
+                                  fontSize: 10, color: Colors.white60)),
+                          Text(item.name,
+                              style: const TextStyle(
+                                  fontSize: 16, fontWeight: FontWeight.bold)),
+                          Text('${item.price} ج.م',
+                              style: const TextStyle(
+                                  color: Color(0xFF00C896),
+                                  fontWeight: FontWeight.bold)),
                           if (qtyInCart > 0)
-                            Text('الكمية: $qtyInCart', style: const TextStyle(color: Colors.amber, fontWeight: FontWeight.bold)),
+                            Text('الكمية: $qtyInCart',
+                                style: const TextStyle(
+                                    color: Colors.amber,
+                                    fontWeight: FontWeight.bold)),
                         ],
                       ),
                     ),
@@ -1700,10 +1992,13 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
           if (resolvedCart.isNotEmpty)
             Container(
               padding: const EdgeInsets.all(12),
-              decoration: BoxDecoration(color: const Color(0xFF181E2C), borderRadius: BorderRadius.circular(12)),
+              decoration: BoxDecoration(
+                  color: const Color(0xFF181E2C),
+                  borderRadius: BorderRadius.circular(12)),
               child: Column(
                 children: [
-                  Text('الإجمالي: ${cartTotal.toStringAsFixed(1)} ج.م', style: const TextStyle(fontWeight: FontWeight.bold)),
+                  Text('الإجمالي: ${cartTotal.toStringAsFixed(1)} ج.م',
+                      style: const TextStyle(fontWeight: FontWeight.bold)),
                   const SizedBox(height: 8),
                   Wrap(
                     spacing: 8,
@@ -1718,7 +2013,8 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                       ),
                       ...tables.map((t) => OutlinedButton(
                             onPressed: () async {
-                              await widget.db.attachDrinksToTable(t, resolvedCart);
+                              await widget.db
+                                  .attachDrinksToTable(t, resolvedCart);
                               setState(() => _posCart.clear());
                             },
                             child: Text('إضافة لـ ${t.name} (Hold)'),
@@ -1740,7 +2036,8 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
         Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
-            const Text('إدارة المخزن', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            const Text('إدارة المخزن',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
             ElevatedButton(
               onPressed: _showAddInventoryDialog,
               child: const Text('إضافة صنف'),
@@ -1750,8 +2047,28 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
         const SizedBox(height: 12),
         ...inventory.map((item) => Card(
               child: ListTile(
-                title: Text(item.name, style: const TextStyle(fontWeight: FontWeight.bold)),
-                subtitle: Text('السعر: ${item.price} ج.م | المخزن: ${item.stock}'),
+                title: Text(item.name,
+                    style: const TextStyle(fontWeight: FontWeight.bold)),
+                subtitle:
+                    Text('السعر: ${item.price} ج.م | المخزن: ${item.stock}'),
+                trailing: Wrap(
+                  spacing: 8,
+                  children: [
+                    OutlinedButton(
+                      onPressed: () => _showEditPriceDialog(item),
+                      child: const Text('السعر'),
+                    ),
+                    OutlinedButton(
+                      onPressed: () => _showEditStockDialog(item),
+                      child: const Text('الكمية'),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.delete_outline,
+                          color: Colors.redAccent),
+                      onPressed: () => widget.db.deleteInventoryItem(item),
+                    ),
+                  ],
+                ),
               ),
             )),
       ],
@@ -1767,19 +2084,75 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
     }
     final grandTotal = drinksRev + tableRev;
 
-    return ListView(
-      padding: const EdgeInsets.all(16),
-      children: [
-        ElevatedButton(
-          style: ElevatedButton.styleFrom(backgroundColor: Colors.green),
-          onPressed: () => _confirmCloseDayDialog(drinksRev, tableRev, grandTotal),
-          child: const Text('تقفيل اليوم وتصفير الشيفت', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-        ),
-        const SizedBox(height: 16),
-        Text('إيراد المشاريب: ${drinksRev.toStringAsFixed(1)} ج.م'),
-        Text('إيراد الترابيزات: ${tableRev.toStringAsFixed(1)} ج.م'),
-        Text('الإجمالي: ${grandTotal.toStringAsFixed(1)} ج.م', style: const TextStyle(color: Color(0xFF00C896), fontWeight: FontWeight.bold)),
-      ],
+    return StreamBuilder<List<ClosedDaySummary>>(
+      stream: widget.db.streamClosedDays(),
+      builder: (context, closedSnap) {
+        final closedDays = closedSnap.data ?? [];
+
+        return ListView(
+          padding: const EdgeInsets.all(16),
+          children: [
+            Card(
+              color: const Color(0xFF1D2331),
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14)),
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  children: [
+                    const Text('تقفيل الشيفت واليوم الحالي',
+                        style: TextStyle(
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                            color: Color(0xFF00C896))),
+                    const SizedBox(height: 10),
+                    Text('إيراد المشاريب: ${drinksRev.toStringAsFixed(1)} ج.م'),
+                    Text('إيراد الترابيزات: ${tableRev.toStringAsFixed(1)} ج.م'),
+                    const Divider(),
+                    Text('الإجمالي الكلي: ${grandTotal.toStringAsFixed(1)} ج.م',
+                        style: const TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.amber)),
+                    const SizedBox(height: 14),
+                    ElevatedButton.icon(
+                      style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.green,
+                          foregroundColor: Colors.white),
+                      onPressed: () => _confirmCloseDayDialog(
+                          drinksRev, tableRev, grandTotal),
+                      icon: const Icon(Icons.lock_clock),
+                      label: const Text('تقفيل اليوم وتصفير الشيفت'),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 24),
+            const Text('سجل الأيام السابقة المتقفلة:',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 10),
+            if (closedDays.isEmpty)
+              const Text('مفيش أيام اتقفلت لسه.')
+            else
+              ...closedDays.map((day) => Card(
+                    color: const Color(0xFF1D2331),
+                    child: ListTile(
+                      title: Text(day.dateLabel,
+                          style: const TextStyle(
+                              fontWeight: FontWeight.bold,
+                              color: Colors.cyanAccent)),
+                      subtitle: Text(
+                          'مشاريب: ${day.drinksRevenue.toStringAsFixed(0)} | ترابيزات: ${day.tablesRevenue.toStringAsFixed(0)}'),
+                      trailing: Text('${day.grandTotal.toStringAsFixed(1)} ج.م',
+                          style: const TextStyle(
+                              fontWeight: FontWeight.bold,
+                              color: Color(0xFF00C896))),
+                    ),
+                  )),
+          ],
+        );
+      },
     );
   }
 
@@ -1812,27 +2185,39 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
           content: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              TextField(controller: nameCtrl, decoration: const InputDecoration(labelText: 'اسم الترابيزة')),
+              TextField(
+                  controller: nameCtrl,
+                  decoration:
+                      const InputDecoration(labelText: 'اسم الترابيزة')),
               DropdownButtonFormField<String>(
                 value: typeVal,
                 items: const [
-                  DropdownMenuItem(value: 'normal', child: Text('ترابيزة عادية (قعدات)')),
-                  DropdownMenuItem(value: 'gaming', child: Text('ترابيزة ألعاب (بساعة)')),
+                  DropdownMenuItem(
+                      value: 'normal', child: Text('ترابيزة عادية (قعدات)')),
+                  DropdownMenuItem(
+                      value: 'gaming', child: Text('ترابيزة ألعاب (بساعة)')),
                 ],
-                onChanged: (val) => setDialogState(() => typeVal = val ?? 'normal'),
+                onChanged: (val) =>
+                    setDialogState(() => typeVal = val ?? 'normal'),
               ),
               if (typeVal == 'gaming')
-                TextField(controller: rateCtrl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'سعر الساعة')),
+                TextField(
+                    controller: rateCtrl,
+                    keyboardType: TextInputType.number,
+                    decoration: const InputDecoration(labelText: 'سعر الساعة')),
             ],
           ),
           actions: [
-            TextButton(onPressed: () => Navigator.pop(context), child: const Text('إلغاء')),
+            TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('إلغاء')),
             ElevatedButton(
               onPressed: () {
                 final name = nameCtrl.text.trim();
                 final rate = double.tryParse(rateCtrl.text) ?? 0;
                 if (name.isNotEmpty) {
-                  widget.db.addNewTable(name: name, type: typeVal, hourlyRate: rate);
+                  widget.db
+                      .addNewTable(name: name, type: typeVal, hourlyRate: rate);
                   Navigator.pop(context);
                 }
               },
@@ -1844,10 +2229,10 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
     );
   }
 
-  // نافذة تعديل بيانات الترابيزة (الاسم، النوع، سعر الساعة)
   void _showEditTableDialog(GamingTable table) {
     final nameCtrl = TextEditingController(text: table.name);
-    final rateCtrl = TextEditingController(text: table.hourlyRate.toStringAsFixed(0));
+    final rateCtrl =
+        TextEditingController(text: table.hourlyRate.toStringAsFixed(0));
     String typeVal = table.type;
 
     showDialog(
@@ -1858,21 +2243,32 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
           content: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              TextField(controller: nameCtrl, decoration: const InputDecoration(labelText: 'اسم الترابيزة')),
+              TextField(
+                  controller: nameCtrl,
+                  decoration:
+                      const InputDecoration(labelText: 'اسم الترابيزة')),
               DropdownButtonFormField<String>(
                 value: typeVal,
                 items: const [
-                  DropdownMenuItem(value: 'normal', child: Text('ترابيزة عادية (قعدات)')),
-                  DropdownMenuItem(value: 'gaming', child: Text('ترابيزة ألعاب (بساعة)')),
+                  DropdownMenuItem(
+                      value: 'normal', child: Text('ترابيزة عادية (قعدات)')),
+                  DropdownMenuItem(
+                      value: 'gaming', child: Text('ترابيزة ألعاب (بساعة)')),
                 ],
-                onChanged: (val) => setDialogState(() => typeVal = val ?? 'normal'),
+                onChanged: (val) =>
+                    setDialogState(() => typeVal = val ?? 'normal'),
               ),
               if (typeVal == 'gaming')
-                TextField(controller: rateCtrl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'سعر الساعة')),
+                TextField(
+                    controller: rateCtrl,
+                    keyboardType: TextInputType.number,
+                    decoration: const InputDecoration(labelText: 'سعر الساعة')),
             ],
           ),
           actions: [
-            TextButton(onPressed: () => Navigator.pop(context), child: const Text('إلغاء')),
+            TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('إلغاء')),
             ElevatedButton(
               onPressed: () {
                 final name = nameCtrl.text.trim();
@@ -1890,7 +2286,6 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
     );
   }
 
-  // تأكيد حذف الترابيزة
   void _confirmDeleteTable(GamingTable table) {
     showDialog(
       context: context,
@@ -1898,7 +2293,9 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
         title: Text('حذف الترابيزة: ${table.name}'),
         content: const Text('هل أنت متأكد من حذف هذه الترابيزة نهائياً؟'),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text('إلغاء')),
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('إلغاء')),
           ElevatedButton(
             style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
             onPressed: () async {
@@ -1912,7 +2309,8 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
     );
   }
 
-  void _showAttachDrinksDialog(GamingTable table, List<InventoryItem> inventory) {
+  void _showAttachDrinksDialog(
+      GamingTable table, List<InventoryItem> inventory) {
     final Map<InventoryItem, int> tempSelection = {};
     showDialog(
       context: context,
@@ -1932,12 +2330,18 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                     children: [
                       IconButton(
                         icon: const Icon(Icons.remove),
-                        onPressed: count > 0 ? () => setDialogState(() => tempSelection[item] = count - 1) : null,
+                        onPressed: count > 0
+                            ? () => setDialogState(
+                                () => tempSelection[item] = count - 1)
+                            : null,
                       ),
                       Text('$count'),
                       IconButton(
                         icon: const Icon(Icons.add),
-                        onPressed: item.stock > count ? () => setDialogState(() => tempSelection[item] = count + 1) : null,
+                        onPressed: item.stock > count
+                            ? () => setDialogState(
+                                () => tempSelection[item] = count + 1)
+                            : null,
                       ),
                     ],
                   ),
@@ -1946,7 +2350,9 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
             ),
           ),
           actions: [
-            TextButton(onPressed: () => Navigator.pop(context), child: const Text('إلغاء')),
+            TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('إلغاء')),
             ElevatedButton(
               onPressed: () {
                 tempSelection.removeWhere((_, v) => v <= 0);
@@ -1963,7 +2369,8 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
     );
   }
 
-  void _showEditTableItemsDialog(GamingTable table, List<InventoryItem> inventory) {
+  void _showEditTableItemsDialog(
+      GamingTable table, List<InventoryItem> inventory) {
     final List<AttachedItem> editableItems = List.from(table.attachedItems);
 
     showDialog(
@@ -1975,45 +2382,49 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
             width: 400,
             height: 300,
             child: editableItems.isEmpty
-                ? const Center(child: Text('مفيش مشاريب مضافة للترابيزة دي حالياً.'))
+                ? const Center(
+                    child: Text('مفيش مشاريب مضافة للترابيزة دي حالياً.'))
                 : ListView.builder(
                     itemCount: editableItems.length,
                     itemBuilder: (context, index) {
                       final item = editableItems[index];
                       return ListTile(
                         title: Text(item.name),
-                        subtitle: Text('السعر: ${item.price} ج.م | الإجمالي: ${item.total.toStringAsFixed(0)}'),
+                        subtitle: Text(
+                            'السعر: ${item.price} ج.م | الإجمالي: ${item.total.toStringAsFixed(0)}'),
                         trailing: Row(
                           mainAxisSize: MainAxisSize.min,
                           children: [
                             IconButton(
-                              icon: const Icon(Icons.remove_circle_outline, color: Colors.orange),
+                              icon: const Icon(Icons.remove_circle_outline,
+                                  color: Colors.orange),
                               onPressed: () {
                                 setDialogState(() {
                                   if (item.qty > 1) {
                                     editableItems[index] = AttachedItem(
-                                      itemId: item.itemId,
-                                      name: item.name,
-                                      price: item.price,
-                                      qty: item.qty - 1,
-                                    );
+                                        itemId: item.itemId,
+                                        name: item.name,
+                                        price: item.price,
+                                        qty: item.qty - 1);
                                   } else {
                                     editableItems.removeAt(index);
                                   }
                                 });
                               },
                             ),
-                            Text('${item.qty}', style: const TextStyle(fontWeight: FontWeight.bold)),
+                            Text('${item.qty}',
+                                style: const TextStyle(
+                                    fontWeight: FontWeight.bold)),
                             IconButton(
-                              icon: const Icon(Icons.add_circle_outline, color: Colors.green),
+                              icon: const Icon(Icons.add_circle_outline,
+                                  color: Colors.green),
                               onPressed: () {
                                 setDialogState(() {
                                   editableItems[index] = AttachedItem(
-                                    itemId: item.itemId,
-                                    name: item.name,
-                                    price: item.price,
-                                    qty: item.qty + 1,
-                                  );
+                                      itemId: item.itemId,
+                                      name: item.name,
+                                      price: item.price,
+                                      qty: item.qty + 1);
                                 });
                               },
                             ),
@@ -2032,7 +2443,9 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                   ),
           ),
           actions: [
-            TextButton(onPressed: () => Navigator.pop(context), child: const Text('إلغاء')),
+            TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text('إلغاء')),
             ElevatedButton(
               onPressed: () async {
                 await widget.db.updateTableAttachedItems(table, editableItems);
@@ -2051,9 +2464,13 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
       context: context,
       builder: (_) => AlertDialog(
         title: Text('حساب الترابيزة - ${table.name}'),
-        content: Text('الإجمالي المطلوب: ${table.grandTotal.toStringAsFixed(2)} ج.م', style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+        content: Text(
+            'الإجمالي المطلوب: ${table.grandTotal.toStringAsFixed(2)} ج.م',
+            style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text('رجوع')),
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('رجوع')),
           ElevatedButton(
             onPressed: () async {
               await widget.db.endAndCheckoutTable(table);
@@ -2071,12 +2488,16 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
       context: context,
       builder: (_) => AlertDialog(
         title: const Text('تقفيل اليوم'),
-        content: Text('هل تريد تقفيل اليوم بإجمالي ${gTotal.toStringAsFixed(1)} ج.م وتصفير الشيفت؟'),
+        content: Text(
+            'هل تريد تقفيل اليوم بإجمالي ${gTotal.toStringAsFixed(1)} ج.م وتصفير الشيفت؟'),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text('إلغاء')),
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('إلغاء')),
           ElevatedButton(
             onPressed: () async {
-              await widget.db.closeCurrentDayAndReset(drinksRev: dRev, tableRev: tRev, grandTotal: gTotal);
+              await widget.db.closeCurrentDayAndReset(
+                  drinksRev: dRev, tableRev: tRev, grandTotal: gTotal);
               if (mounted) Navigator.pop(context);
             },
             child: const Text('نعم، قفّل'),
@@ -2097,24 +2518,93 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
         content: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            TextField(controller: nameCtrl, decoration: const InputDecoration(labelText: 'اسم الصنف')),
-            TextField(controller: priceCtrl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'السعر')),
-            TextField(controller: stockCtrl, keyboardType: TextInputType.number, decoration: const InputDecoration(labelText: 'الكمية')),
+            TextField(
+                controller: nameCtrl,
+                decoration: const InputDecoration(labelText: 'اسم الصنف')),
+            TextField(
+                controller: priceCtrl,
+                keyboardType: TextInputType.number,
+                decoration: const InputDecoration(labelText: 'السعر')),
+            TextField(
+                controller: stockCtrl,
+                keyboardType: TextInputType.number,
+                decoration: const InputDecoration(labelText: 'الكمية')),
           ],
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(context), child: const Text('إلغاء')),
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('إلغاء')),
           ElevatedButton(
             onPressed: () {
               final name = nameCtrl.text.trim();
               final price = double.tryParse(priceCtrl.text) ?? 0;
               final stock = int.tryParse(stockCtrl.text) ?? 0;
               if (name.isNotEmpty && price > 0) {
-                widget.db.addNewInventoryItem(name: name, price: price, stock: stock, threshold: 5);
+                widget.db.addNewInventoryItem(
+                    name: name, price: price, stock: stock, threshold: 5);
                 Navigator.pop(context);
               }
             },
             child: const Text('إضافة'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showEditPriceDialog(InventoryItem item) {
+    final ctrl = TextEditingController(text: item.price.toStringAsFixed(1));
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: Text('تعديل سعر: ${item.name}'),
+        content: TextField(
+          controller: ctrl,
+          keyboardType: TextInputType.number,
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('إلغاء')),
+          ElevatedButton(
+            onPressed: () {
+              final val = double.tryParse(ctrl.text);
+              if (val != null && val > 0) {
+                widget.db.updateItemPrice(item, val);
+                Navigator.pop(context);
+              }
+            },
+            child: const Text('حفظ'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showEditStockDialog(InventoryItem item) {
+    final ctrl = TextEditingController(text: item.stock.toString());
+    showDialog(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: Text('تعديل الكمية: ${item.name}'),
+        content: TextField(
+          controller: ctrl,
+          keyboardType: TextInputType.number,
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('إلغاء')),
+          ElevatedButton(
+            onPressed: () {
+              final val = int.tryParse(ctrl.text);
+              if (val != null && val >= 0) {
+                widget.db.updateItemStock(item, val);
+                Navigator.pop(context);
+              }
+            },
+            child: const Text('حفظ'),
           ),
         ],
       ),
