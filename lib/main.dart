@@ -15,9 +15,6 @@ import 'package:uuid/uuid.dart';
 final GlobalKey<ScaffoldMessengerState> rootScaffoldMessengerKey =
     GlobalKey<ScaffoldMessengerState>();
 
-// =============================================================================
-// 0. APP VERSION & REMOTE OTA UPDATE CONFIG
-// =============================================================================
 const String kCurrentAppVersion = '1.0.1';
 const String kRemoteVersionJsonUrl =
     'https://raw.githubusercontent.com/kirollostharwat-glitch/joker-cafe/main/version.json';
@@ -52,10 +49,6 @@ class AppUpdateService {
     } catch (_) {}
   }
 }
-
-// =============================================================================
-// 1. DATA MODELS
-// =============================================================================
 
 class InventoryItem {
   final String id;
@@ -132,8 +125,8 @@ class GamingTable {
   final String id;
   final String name;
   final double hourlyRate;
-  final String type; // 'gaming' or 'normal'
-  final String status; // 'idle', 'running', 'paused'
+  final String type;
+  final String status;
   final DateTime? lastStartTime;
   final int accumulatedSeconds;
   final List<AttachedItem> attachedItems;
@@ -403,10 +396,6 @@ class AuditLog {
   }
 }
 
-// =============================================================================
-// 2. NOTIFICATION SERVICE
-// =============================================================================
-
 class NotificationService {
   static final NotificationService _instance = NotificationService._internal();
   factory NotificationService() => _instance;
@@ -454,10 +443,6 @@ class NotificationService {
     } catch (_) {}
   }
 }
-
-// =============================================================================
-// 3. FIRESTORE + AUTO LAN P2P REAL-TIME SYNC SERVICE
-// =============================================================================
 
 class FirestoreService {
   FirebaseFirestore? _db;
@@ -1582,10 +1567,6 @@ class FirestoreService {
     }
   }
 }
-
-// =============================================================================
-// 4. MAIN ENTRY POINT & ANTI-LAG UI
-// =============================================================================
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -2976,10 +2957,6 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
     );
   }
 }
-
-// =============================================================================
-// 5. ISOLATED TABLE CARD WIDGET (ANTI-LAG)
-// =============================================================================
 
 class _TableCardWidget extends StatefulWidget {
   final GamingTable table;
