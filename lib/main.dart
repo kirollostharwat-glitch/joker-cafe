@@ -20,7 +20,7 @@ const String kRemoteVersionJsonUrl =
     'https://raw.githubusercontent.com/kirollostharwat-glitch/joker-cafe/main/version.json';
 
 class AppUpdateService {
-  static Future?> checkForUpdate() async {
+  static Future> checkForUpdate() async {
     try {
       final client = HttpClient()
         ..connectionTimeout = const Duration(seconds: 5);
@@ -28,14 +28,17 @@ class AppUpdateService {
       final res = await req.close();
       if (res.statusCode == 200) {
         final body = await res.transform(utf8.decoder).join();
-        final data = jsonDecode(body) as Map<String, dynamic>;
-        final latestVersion = (data['version'] ?? '').toString().trim();
-        if (latestVersion.isNotEmpty && latestVersion != kCurrentAppVersion) {
-          return data;
+        final decoded = jsonDecode(body);
+        if (decoded is Map) {
+          final data = Map<String, dynamic>.from(decoded);
+          final latestVersion = (data['version'] ?? '').toString().trim();
+          if (latestVersion.isNotEmpty && latestVersion != kCurrentAppVersion) {
+            return data;
+          }
         }
       }
     } catch (_) {}
-    return null;
+    return <String, dynamic>{};
   }
 
   static Future<void> openDownloadUrl(String url) async {
@@ -86,7 +89,8 @@ class InventoryItem {
   }
 
   factory InventoryItem.fromDoc(DocumentSnapshot doc) {
-    final data = doc.data() as Map<String, dynamic>? ?? {};
+    final raw = doc.data();
+    final data = raw is Map ? Map<String, dynamic>.from(raw) : <String, dynamic>{};
     return InventoryItem.fromMap(data, doc.id);
   }
 }
@@ -212,7 +216,8 @@ class GamingTable {
   }
 
   factory GamingTable.fromDoc(DocumentSnapshot doc) {
-    final data = doc.data() as Map<String, dynamic>? ?? {};
+    final raw = doc.data();
+    final data = raw is Map ? Map<String, dynamic>.from(raw) : <String, dynamic>{};
     return GamingTable.fromMap(data, doc.id);
   }
 }
@@ -280,7 +285,8 @@ class SaleRecord {
   }
 
   factory SaleRecord.fromDoc(DocumentSnapshot doc) {
-    final data = doc.data() as Map<String, dynamic>? ?? {};
+    final raw = doc.data();
+    final data = raw is Map ? Map<String, dynamic>.from(raw) : <String, dynamic>{};
     return SaleRecord.fromMap(data, doc.id);
   }
 }
@@ -334,7 +340,8 @@ class ClosedDaySummary {
   }
 
   factory ClosedDaySummary.fromDoc(DocumentSnapshot doc) {
-    final data = doc.data() as Map<String, dynamic>? ?? {};
+    final raw = doc.data();
+    final data = raw is Map ? Map<String, dynamic>.from(raw) : <String, dynamic>{};
     return ClosedDaySummary.fromMap(data, doc.id);
   }
 }
@@ -391,7 +398,8 @@ class AuditLog {
   }
 
   factory AuditLog.fromDoc(DocumentSnapshot doc) {
-    final data = doc.data() as Map<String, dynamic>? ?? {};
+    final raw = doc.data();
+    final data = raw is Map ? Map<String, dynamic>.from(raw) : <String, dynamic>{};
     return AuditLog.fromMap(data, doc.id);
   }
 }
@@ -629,7 +637,9 @@ class FirestoreService {
 
   void _handleReceivedSyncLine(String line) {
     try {
-      final map = jsonDecode(line) as Map<String, dynamic>;
+      final decoded = jsonDecode(line);
+      if (decoded is! Map) return;
+      final map = Map<String, dynamic>.from(decoded);
       if (map['type'] != 'FULL_SYNC') return;
       if (map['senderId'] == deviceId) return;
 
@@ -1633,7 +1643,7 @@ class AdminDashboardShell extends StatefulWidget {
 class _AdminDashboardShellState extends State<AdminDashboardShell> {
   int _selectedIndex = 0;
   final Map<String, int> _posCart = {};
-  Map<String, dynamic>? _availableUpdate;
+  Map<String, dynamic> _availableUpdate = {};
 
   @override
   void initState() {
@@ -1644,7 +1654,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
   Future<void> _checkRemoteUpdate({bool showNoUpdateToast = false}) async {
     final update = await AppUpdateService.checkForUpdate();
     if (!mounted) return;
-    if (update != null) {
+    if (update.isNotEmpty) {
       setState(() => _availableUpdate = update);
       _showUpdateDialog(update);
     } else if (showNoUpdateToast) {
@@ -1743,7 +1753,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                                 IconButton(
                                   icon: Icon(
                                     Icons.system_update_alt,
-                                    color: _availableUpdate != null
+                                    color: _availableUpdate.isNotEmpty
                                         ? Colors.amberAccent
                                         : Colors.white70,
                                   ),
