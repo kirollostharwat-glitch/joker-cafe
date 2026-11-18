@@ -9,6 +9,10 @@ jobs:
       - run: |
           flutter create . --platforms=windows
           flutter pub get
+          - name: Change App Name to Joker Cafe & Set Joker Icon
+            run: |
+          dart run rename_app:main all="Joker Cafe"
+          dart run flutter_launcher_icons
           flutter build windows --release
       - uses: actions/upload-artifact@v4
         with:
