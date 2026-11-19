@@ -109,8 +109,9 @@ class ExpenseRecord {
         'id': id,
         'title': title,
         'amount': amount,
-        'timestamp':
-            forLocal ? timestamp.toIso8601String() : Timestamp.fromDate(timestamp),
+        'timestamp': forLocal
+            ? timestamp.toIso8601String()
+            : Timestamp.fromDate(timestamp),
       };
 
   factory ExpenseRecord.fromMap(Map<String, dynamic> data, [String? docId]) {
@@ -717,8 +718,7 @@ class FirestoreService {
         'tables': _localTables.map((e) => e.toMap(forLocal: true)).toList(),
         'inv': _localInv.map((e) => e.toMap()).toList(),
         'sales': _localSales.map((e) => e.toMap(forLocal: true)).toList(),
-        'expenses':
-            _localExpenses.map((e) => e.toMap(forLocal: true)).toList(),
+        'expenses': _localExpenses.map((e) => e.toMap(forLocal: true)).toList(),
         'closedDays':
             _localClosedDays.map((e) => e.toMap(forLocal: true)).toList(),
         'logs':
@@ -1091,7 +1091,6 @@ class FirestoreService {
   Stream<List<ClosedDaySummary>> streamClosedDays() => _closedDaysCtrl.stream;
   Stream<List<AuditLog>> streamAuditLogs() => _logsCtrl.stream;
 
-  // إضافة مصروف يومي يُخصم من مجمل اليوم
   Future<void> addDailyExpense(
       {required String title, required double amount}) async {
     final expense = ExpenseRecord(
@@ -2688,7 +2687,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                     Wrap(
                       spacing: 10,
                       runSpacing: 10,
-                      alignment: Alignment.center,
+                      alignment: WrapAlignment.center,
                       children: [
                         ElevatedButton.icon(
                           style: ElevatedButton.styleFrom(
