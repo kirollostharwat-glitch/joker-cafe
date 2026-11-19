@@ -240,6 +240,7 @@ class GamingTable {
 class SaleRecord {
   final String id;
   final String type;
+  final String label;
   final double timeRevenue;
   final double drinksRevenue;
   final double totalRevenue;
@@ -251,6 +252,7 @@ class SaleRecord {
   SaleRecord({
     required this.id,
     required this.type,
+    this.label = 'فاتورة بيع مباشر',
     required this.timeRevenue,
     required this.drinksRevenue,
     required this.totalRevenue,
@@ -263,6 +265,7 @@ class SaleRecord {
   Map<String, dynamic> toMap({bool forLocal = false}) => {
         'id': id,
         'type': type,
+        'label': label,
         'timeRevenue': timeRevenue,
         'drinksRevenue': drinksRevenue,
         'totalRevenue': totalRevenue,
@@ -284,9 +287,12 @@ class SaleRecord {
       parsedTime = DateTime.tryParse(rawTime) ?? DateTime.now();
     }
 
+    final typeStr = data['type'] ?? 'drinks_only';
     return SaleRecord(
       id: docId ?? data['id'] ?? const Uuid().v4(),
-      type: data['type'] ?? 'drinks_only',
+      type: typeStr,
+      label: data['label'] ??
+          (typeStr == 'drinks_only' ? 'فاتورة بيع مباشر' : 'فاتورة ترابيزة'),
       timeRevenue: (data['timeRevenue'] ?? 0).toDouble(),
       drinksRevenue: (data['drinksRevenue'] ?? 0).toDouble(),
       totalRevenue: (data['totalRevenue'] ?? 0).toDouble(),
@@ -1091,6 +1097,65 @@ class FirestoreService {
   Stream<List<ClosedDaySummary>> streamClosedDays() => _closedDaysCtrl.stream;
   Stream<List<AuditLog>> streamAuditLogs() => _logsCtrl.stream;
 
+  // ريست / تصفير فواتير الشيفت الحالي فقط مع إرجاع الأصناف للمخزن
+  Future<void> resetCurrentShiftInvoices() async {
+    for (final sale in _localSales.where((s) => !s.isClosed)) {
+      for (final item in sale.soldItems) {
+        final iIdx = _localInv.indexWhere((i) => i.id == item.itemId);
+        if (iIdx >= 0) {
+          _localInv[iIdx] = InventoryItem(
+            id: _localInv[iIdx].id,
+            name: _localInv[iIdx].name,
+            price: _localInv[iIdx].price,
+            stock: _localInv[iIdx].stock + item.qty,
+            lowStockThreshold: _localInv[iIdx].lowStockThreshold,
+          );
+        }
+      }
+    }
+
+    _localSales.removeWhere((s) => !s.isClosed);
+    _saveAndEmitLocal();
+
+    if (useCloud) {
+      try {
+        final snap = await _db!.collection('sales').get();
+        for (final doc in snap.docs) {
+          await doc.reference.delete();
+        }
+      } catch (_) {}
+    }
+
+    await _recordAudit(
+      title: 'ريست فواتير الشيفت',
+      message: 'تم تصفير كافة فواتير الشيفت الحالي وإرجاع الكميات للمخزن',
+      beforeVal: 'فواتير نشطة',
+      afterVal: '0 فاتورة',
+    );
+  }
+
+  // ريست / تصفير الشهر بالكامل (تصفير سجل الأيام المتقفلة)
+  Future<void> resetMonthHistory() async {
+    _localClosedDays.clear();
+    _saveAndEmitLocal();
+
+    if (useCloud) {
+      try {
+        final snap = await _db!.collection('closed_days').get();
+        for (final doc in snap.docs) {
+          await doc.reference.delete();
+        }
+      } catch (_) {}
+    }
+
+    await _recordAudit(
+      title: 'ريست حسابات الشهر',
+      message: 'تم تصفير سجل الأيام المتقفلة لبدء شهر جديد',
+      beforeVal: 'أيام سابقة',
+      afterVal: 'شهر جديد (0.0)',
+    );
+  }
+
   Future<void> addDailyExpense(
       {required String title, required double amount}) async {
     final expense = ExpenseRecord(
@@ -1407,6 +1472,7 @@ class FirestoreService {
     final sale = SaleRecord(
       id: const Uuid().v4(),
       type: table.type == 'normal' ? 'normal_checkout' : 'gaming_checkout',
+      label: 'فاتورة ${table.name}',
       timeRevenue: timeCost,
       drinksRevenue: drinksCost,
       totalRevenue: total,
@@ -1485,6 +1551,7 @@ class FirestoreService {
     final sale = SaleRecord(
         id: const Uuid().v4(),
         type: 'drinks_only',
+        label: 'فاتورة بيع مباشر',
         timeRevenue: 0,
         drinksRevenue: totalDrinks,
         totalRevenue: totalDrinks,
@@ -1550,6 +1617,7 @@ class FirestoreService {
         _localSales[sIdx] = SaleRecord(
           id: oldSale.id,
           type: oldSale.type,
+          label: oldSale.label,
           timeRevenue: oldSale.timeRevenue,
           drinksRevenue: newDrinksRev,
           totalRevenue: newTotalRev,
@@ -1578,7 +1646,7 @@ class FirestoreService {
     }
 
     await _recordAudit(
-      title: 'تعديل فاتورة مبيعات',
+      title: 'تعديل فاتورة (${oldSale.label})',
       message:
           'تم تعديل الفاتورة من ${oldTotal.toStringAsFixed(1)} إلى ${newTotalRev.toStringAsFixed(1)} ج.م',
       beforeVal: '${oldTotal.toStringAsFixed(1)} ج.م',
@@ -1610,7 +1678,7 @@ class FirestoreService {
     }
 
     await _recordAudit(
-      title: 'إلغاء وحذف فاتورة',
+      title: 'حذف فاتورة (${sale.label})',
       message:
           'تم حذف فاتورة بقيمة ${sale.totalRevenue.toStringAsFixed(1)} ج.م وإرجاع الكميات للمخزن',
       beforeVal: '${sale.totalRevenue.toStringAsFixed(1)} ج.م',
@@ -2229,8 +2297,6 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
       }
     }
 
-    final directSales = sales.where((s) => s.type == 'drinks_only').toList();
-
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
@@ -2380,17 +2446,30 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
           ),
         ],
         const Divider(height: 32),
-        const Text('فواتير البيع المباشر المسجلة في الشيفت (تعديل / إلغاء):',
-            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            const Text('فواتير الشيفت (تعديل / حذف / ريست):',
+                style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+            if (sales.isNotEmpty)
+              TextButton.icon(
+                onPressed: _confirmResetShiftInvoicesDialog,
+                icon: const Icon(Icons.restart_alt,
+                    color: Colors.orangeAccent, size: 18),
+                label: const Text('ريست الفواتير',
+                    style: TextStyle(color: Colors.orangeAccent)),
+              ),
+          ],
+        ),
         const SizedBox(height: 10),
-        if (directSales.isEmpty)
-          const Text('مفيش فواتير بيع مباشر مسجلة في الشيفت الحالي لسه.',
+        if (sales.isEmpty)
+          const Text('مفيش فواتير مسجلة في الشيفت الحالي لسه.',
               style: TextStyle(color: Colors.white60))
         else
-          ...directSales.map((sale) {
-            final itemsSummary = sale.soldItems
-                .map((e) => '${e.name} × ${e.qty}')
-                .join(' ، ');
+          ...sales.map((sale) {
+            final itemsSummary = sale.soldItems.isEmpty
+                ? 'حساب وقت فقط'
+                : sale.soldItems.map((e) => '${e.name} × ${e.qty}').join(' ، ');
             final timeStr = intl.DateFormat('hh:mm a').format(sale.timestamp);
             return Card(
               margin: const EdgeInsets.only(bottom: 8),
@@ -2398,7 +2477,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                 leading:
                     const Icon(Icons.receipt_long, color: Color(0xFF00C896)),
                 title: Text(
-                  '${sale.totalRevenue.toStringAsFixed(1)} ج.م  ($timeStr)',
+                  '${sale.label} - ${sale.totalRevenue.toStringAsFixed(1)} ج.م  ($timeStr)',
                   style: const TextStyle(fontWeight: FontWeight.bold),
                 ),
                 subtitle: Text(itemsSummary),
@@ -2425,6 +2504,30 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
     );
   }
 
+  void _confirmResetShiftInvoicesDialog() {
+    showDialog(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        title: const Text('ريست / تصفير فواتير الشيفت'),
+        content: const Text(
+            'هل تريد مسح جميع فواتير الشيفت الحالي وإرجاع الكميات المباعة للمخزن؟'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(dialogCtx),
+              child: const Text('إلغاء')),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
+            onPressed: () async {
+              Navigator.pop(dialogCtx);
+              await widget.db.resetCurrentShiftInvoices();
+            },
+            child: const Text('نعم، ريست الفواتير'),
+          ),
+        ],
+      ),
+    );
+  }
+
   void _showEditSaleDialog(SaleRecord sale, List<InventoryItem> inventory) {
     final List<AttachedItem> editableItems = List.from(sale.soldItems);
 
@@ -2432,7 +2535,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
       context: context,
       builder: (dialogCtx) => StatefulBuilder(
         builder: (context, setDialogState) => AlertDialog(
-          title: const Text('تعديل فاتورة البيع المباشر'),
+          title: Text('تعديل ${sale.label}'),
           content: SizedBox(
             width: 420,
             height: 340,
@@ -2474,7 +2577,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                   child: editableItems.isEmpty
                       ? const Center(
                           child: Text(
-                              'الفاتورة أصبحت فارغة (سيتم حذفها عند الحفظ)'))
+                              'لا توجد أصناف في الفاتورة (سيتم حفظ التعديل تلقائياً)'))
                       : ListView.builder(
                           itemCount: editableItems.length,
                           itemBuilder: (context, index) {
@@ -2565,7 +2668,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
     showDialog(
       context: context,
       builder: (dialogCtx) => AlertDialog(
-        title: const Text('حذف فاتورة البيع المباشر'),
+        title: const Text('حذف الفاتورة'),
         content: Text(
             'هل تريد حذف هذه الفاتورة (${sale.totalRevenue.toStringAsFixed(1)} ج.م) وإرجاع الكميات للمخزن؟'),
         actions: [
@@ -2649,6 +2752,9 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
       stream: widget.db.streamClosedDays(),
       builder: (context, closedSnap) {
         final closedDays = closedSnap.data ?? [];
+        final monthTotal = closedDays.fold<double>(
+                0.0, (sum, day) => sum + day.grandTotal) +
+            netTotal;
 
         return ListView(
           padding: const EdgeInsets.all(16),
@@ -2683,6 +2789,13 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                             fontSize: 18,
                             fontWeight: FontWeight.bold,
                             color: Colors.amber)),
+                    const SizedBox(height: 6),
+                    Text(
+                        'إجمالي الشهر الحالي: ${monthTotal.toStringAsFixed(1)} ج.م',
+                        style: const TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.cyanAccent)),
                     const SizedBox(height: 14),
                     Wrap(
                       spacing: 10,
@@ -2706,6 +2819,13 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                               drinksRev, tableRev, totalExpenses, netTotal),
                           icon: const Icon(Icons.lock_clock),
                           label: const Text('تقفيل اليوم وتصفير الشيفت'),
+                        ),
+                        OutlinedButton.icon(
+                          style: OutlinedButton.styleFrom(
+                              foregroundColor: Colors.redAccent),
+                          onPressed: _confirmResetMonthDialog,
+                          icon: const Icon(Icons.calendar_month),
+                          label: const Text('ريست الشهر'),
                         ),
                       ],
                     ),
@@ -2760,8 +2880,22 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                     ),
                   )),
             const SizedBox(height: 24),
-            const Text('سجل الأيام السابقة المتقفلة:',
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Text('سجل الأيام السابقة المتقفلة:',
+                    style:
+                        TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                if (closedDays.isNotEmpty)
+                  TextButton.icon(
+                    onPressed: _confirmResetMonthDialog,
+                    icon: const Icon(Icons.delete_forever,
+                        color: Colors.redAccent, size: 18),
+                    label: const Text('تصفير الشهر',
+                        style: TextStyle(color: Colors.redAccent)),
+                  ),
+              ],
+            ),
             const SizedBox(height: 10),
             if (closedDays.isEmpty)
               const Text('مفيش أيام اتقفلت لسه.')
@@ -2784,6 +2918,30 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
           ],
         );
       },
+    );
+  }
+
+  void _confirmResetMonthDialog() {
+    showDialog(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        title: const Text('ريست / تصفير حسابات الشهر'),
+        content: const Text(
+            'هل أنت متأكد من تصفير سجل الأيام المتقفلة للشهر الحالي؟'),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(dialogCtx),
+              child: const Text('إلغاء')),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
+            onPressed: () async {
+              Navigator.pop(dialogCtx);
+              await widget.db.resetMonthHistory();
+            },
+            child: const Text('نعم، ريست الشهر'),
+          ),
+        ],
+      ),
     );
   }
 
