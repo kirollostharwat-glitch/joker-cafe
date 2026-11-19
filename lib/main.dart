@@ -92,6 +92,52 @@ class AttachedItem {
       );
 }
 
+class ExpenseRecord {
+  final String id;
+  final String title;
+  final double amount;
+  final DateTime timestamp;
+
+  ExpenseRecord({
+    required this.id,
+    required this.title,
+    required this.amount,
+    required this.timestamp,
+  });
+
+  Map<String, dynamic> toMap({bool forLocal = false}) => {
+        'id': id,
+        'title': title,
+        'amount': amount,
+        'timestamp':
+            forLocal ? timestamp.toIso8601String() : Timestamp.fromDate(timestamp),
+      };
+
+  factory ExpenseRecord.fromMap(Map<String, dynamic> data, [String? docId]) {
+    DateTime parsedTime = DateTime.now();
+    final rawTime = data['timestamp'];
+    if (rawTime is Timestamp) {
+      parsedTime = rawTime.toDate();
+    } else if (rawTime is String) {
+      parsedTime = DateTime.tryParse(rawTime) ?? DateTime.now();
+    }
+
+    return ExpenseRecord(
+      id: docId ?? data['id'] ?? const Uuid().v4(),
+      title: data['title'] ?? '',
+      amount: (data['amount'] ?? 0).toDouble(),
+      timestamp: parsedTime,
+    );
+  }
+
+  factory ExpenseRecord.fromDoc(DocumentSnapshot doc) {
+    final raw = doc.data();
+    final data =
+        raw is Map ? Map<String, dynamic>.from(raw) : <String, dynamic>{};
+    return ExpenseRecord.fromMap(data, doc.id);
+  }
+}
+
 class GamingTable {
   final String id;
   final String name;
@@ -265,6 +311,7 @@ class ClosedDaySummary {
   final String dateLabel;
   final double drinksRevenue;
   final double tablesRevenue;
+  final double expensesTotal;
   final double grandTotal;
   final DateTime closedAt;
 
@@ -273,6 +320,7 @@ class ClosedDaySummary {
     required this.dateLabel,
     required this.drinksRevenue,
     required this.tablesRevenue,
+    this.expensesTotal = 0.0,
     required this.grandTotal,
     required this.closedAt,
   });
@@ -282,6 +330,7 @@ class ClosedDaySummary {
         'dateLabel': dateLabel,
         'drinksRevenue': drinksRevenue,
         'tablesRevenue': tablesRevenue,
+        'expensesTotal': expensesTotal,
         'grandTotal': grandTotal,
         'closedAt': forLocal
             ? closedAt.toIso8601String()
@@ -303,6 +352,7 @@ class ClosedDaySummary {
       drinksRevenue: (data['drinksRevenue'] ?? 0).toDouble(),
       tablesRevenue:
           (data['tablesRevenue'] ?? (data['billiardRevenue'] ?? 0)).toDouble(),
+      expensesTotal: (data['expensesTotal'] ?? 0).toDouble(),
       grandTotal: (data['grandTotal'] ?? 0).toDouble(),
       closedAt: parsedTime,
     );
@@ -428,7 +478,7 @@ class NotificationService {
 }
 
 // =============================================================================
-// 3. FIRESTORE + AUTO LAN P2P REAL-TIME SYNC SERVICE
+// 3. FIRESTORE + ENHANCED WINDOWS/ANDROID LAN P2P REAL-TIME SYNC SERVICE
 // =============================================================================
 
 class FirestoreService {
@@ -450,14 +500,20 @@ class FirestoreService {
   final _tablesCtrl = StreamController<List<GamingTable>>.broadcast();
   final _invCtrl = StreamController<List<InventoryItem>>.broadcast();
   final _salesCtrl = StreamController<List<SaleRecord>>.broadcast();
+  final _expensesCtrl = StreamController<List<ExpenseRecord>>.broadcast();
   final _closedDaysCtrl = StreamController<List<ClosedDaySummary>>.broadcast();
   final _logsCtrl = StreamController<List<AuditLog>>.broadcast();
+  final _peersCountCtrl = StreamController<int>.broadcast();
 
   List<GamingTable> _localTables = [];
   List<InventoryItem> _localInv = [];
   List<SaleRecord> _localSales = [];
+  List<ExpenseRecord> _localExpenses = [];
   List<ClosedDaySummary> _localClosedDays = [];
   List<AuditLog> _localLogs = [];
+
+  int get connectedPeersCount => _peerSockets.length;
+  Stream<int> streamConnectedPeersCount() => _peersCountCtrl.stream;
 
   Future<void> initAndSeed({required bool firebaseReady}) async {
     _prefs = await SharedPreferences.getInstance();
@@ -490,7 +546,50 @@ class FirestoreService {
       _listenToAuditLogsForNotifications();
     }
 
+    await _ensureWindowsFirewallRule();
     await _startAutoLanSyncEngine();
+  }
+
+  Future<void> _ensureWindowsFirewallRule() async {
+    if (!Platform.isWindows) return;
+    try {
+      await Process.run('netsh', [
+        'advfirewall',
+        'firewall',
+        'add',
+        'rule',
+        'name=JokerCafeSyncTCP',
+        'dir=in',
+        'action=allow',
+        'protocol=TCP',
+        'localport=$_syncTcpPort'
+      ]);
+      await Process.run('netsh', [
+        'advfirewall',
+        'firewall',
+        'add',
+        'rule',
+        'name=JokerCafeSyncUDP',
+        'dir=in',
+        'action=allow',
+        'protocol=UDP',
+        'localport=$_syncUdpPort'
+      ]);
+    } catch (_) {}
+  }
+
+  Future<List<String>> getLocalIpAddresses() async {
+    final List<String> ips = [];
+    try {
+      final interfaces = await NetworkInterface.list(
+          includeLoopback: false, type: InternetAddressType.IPv4);
+      for (final iface in interfaces) {
+        for (final addr in iface.addresses) {
+          ips.add(addr.address);
+        }
+      }
+    } catch (_) {}
+    return ips;
   }
 
   Future<void> _startAutoLanSyncEngine() async {
@@ -515,43 +614,80 @@ class FirestoreService {
             if (senderDeviceId != deviceId) {
               final peerIp = dg.address.address;
               if (!_connectedPeerIps.contains(peerIp)) {
-                _connectToPeer(peerIp);
+                connectToPeerManual(peerIp);
               }
             }
           }
         }
       });
 
-      _discoveryTimer = Timer.periodic(const Duration(seconds: 3), (_) {
-        try {
-          final packet = utf8.encode('JOKER_SYNC:$deviceId');
-          _udpSocket?.send(
-              packet, InternetAddress('255.255.255.255'), _syncUdpPort);
-        } catch (_) {}
+      _broadcastDiscoveryPackets();
+      _discoveryTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+        _broadcastDiscoveryPackets();
       });
+    } catch (_) {}
+
+    final savedPeerIp = _prefs.getString('last_peer_ip');
+    if (savedPeerIp != null && savedPeerIp.isNotEmpty) {
+      connectToPeerManual(savedPeerIp);
+    }
+  }
+
+  Future<void> _broadcastDiscoveryPackets() async {
+    if (_udpSocket == null) return;
+    final packet = utf8.encode('JOKER_SYNC:$deviceId');
+
+    try {
+      _udpSocket!
+          .send(packet, InternetAddress('255.255.255.255'), _syncUdpPort);
+    } catch (_) {}
+
+    try {
+      final interfaces = await NetworkInterface.list(
+          includeLoopback: false, type: InternetAddressType.IPv4);
+      for (final iface in interfaces) {
+        for (final addr in iface.addresses) {
+          final parts = addr.address.split('.');
+          if (parts.length == 4) {
+            final subnetBroadcast = '${parts[0]}.${parts[1]}.${parts[2]}.255';
+            try {
+              _udpSocket!.send(
+                  packet, InternetAddress(subnetBroadcast), _syncUdpPort);
+            } catch (_) {}
+          }
+        }
+      }
     } catch (_) {}
   }
 
-  Future<void> _connectToPeer(String ip) async {
-    if (_connectedPeerIps.contains(ip)) return;
-    _connectedPeerIps.add(ip);
+  Future<bool> connectToPeerManual(String ip) async {
+    final cleanIp = ip.trim();
+    if (cleanIp.isEmpty) return false;
+    if (_connectedPeerIps.contains(cleanIp)) return true;
+
+    _connectedPeerIps.add(cleanIp);
     try {
-      final socket = await Socket.connect(ip, _syncTcpPort,
+      final socket = await Socket.connect(cleanIp, _syncTcpPort,
           timeout: const Duration(seconds: 3));
+      await _prefs.setString('last_peer_ip', cleanIp);
       _setupPeerSocket(socket);
+      return true;
     } catch (_) {
-      _connectedPeerIps.remove(ip);
+      _connectedPeerIps.remove(cleanIp);
+      return false;
     }
   }
 
   void _handleIncomingPeerSocket(Socket socket) {
     final ip = socket.remoteAddress.address;
     _connectedPeerIps.add(ip);
+    _prefs.setString('last_peer_ip', ip);
     _setupPeerSocket(socket);
   }
 
   void _setupPeerSocket(Socket socket) {
     _peerSockets.add(socket);
+    _peersCountCtrl.add(_peerSockets.length);
     _sendSyncPayloadToSocket(socket);
 
     utf8.decoder
@@ -564,9 +700,11 @@ class FirestoreService {
     }, onDone: () {
       _peerSockets.remove(socket);
       _connectedPeerIps.remove(socket.remoteAddress.address);
+      _peersCountCtrl.add(_peerSockets.length);
     }, onError: (_) {
       _peerSockets.remove(socket);
       _connectedPeerIps.remove(socket.remoteAddress.address);
+      _peersCountCtrl.add(_peerSockets.length);
     });
   }
 
@@ -579,6 +717,8 @@ class FirestoreService {
         'tables': _localTables.map((e) => e.toMap(forLocal: true)).toList(),
         'inv': _localInv.map((e) => e.toMap()).toList(),
         'sales': _localSales.map((e) => e.toMap(forLocal: true)).toList(),
+        'expenses':
+            _localExpenses.map((e) => e.toMap(forLocal: true)).toList(),
         'closedDays':
             _localClosedDays.map((e) => e.toMap(forLocal: true)).toList(),
         'logs':
@@ -586,6 +726,11 @@ class FirestoreService {
       });
       s.write('$payload\n');
     } catch (_) {}
+  }
+
+  void forceSyncNow() {
+    _broadcastDiscoveryPackets();
+    _broadcastLanSync();
   }
 
   void _broadcastLanSync({AuditLog? latestLog}) {
@@ -597,6 +742,7 @@ class FirestoreService {
       'tables': _localTables.map((e) => e.toMap(forLocal: true)).toList(),
       'inv': _localInv.map((e) => e.toMap()).toList(),
       'sales': _localSales.map((e) => e.toMap(forLocal: true)).toList(),
+      'expenses': _localExpenses.map((e) => e.toMap(forLocal: true)).toList(),
       'closedDays':
           _localClosedDays.map((e) => e.toMap(forLocal: true)).toList(),
       'logs':
@@ -610,6 +756,7 @@ class FirestoreService {
         s.write('$payload\n');
       } catch (_) {
         _peerSockets.remove(s);
+        _peersCountCtrl.add(_peerSockets.length);
       }
     }
   }
@@ -644,6 +791,11 @@ class FirestoreService {
       if (map['sales'] != null) {
         _localSales = (map['sales'] as List)
             .map((e) => SaleRecord.fromMap(Map<String, dynamic>.from(e)))
+            .toList();
+      }
+      if (map['expenses'] != null) {
+        _localExpenses = (map['expenses'] as List)
+            .map((e) => ExpenseRecord.fromMap(Map<String, dynamic>.from(e)))
             .toList();
       }
       if (map['closedDays'] != null) {
@@ -695,6 +847,12 @@ class FirestoreService {
           .toList();
       _localSales = list;
       _salesCtrl.add(list);
+    });
+
+    _db!.collection('expenses').snapshots().listen((snapshot) {
+      final list = snapshot.docs.map(ExpenseRecord.fromDoc).toList();
+      _localExpenses = list;
+      _expensesCtrl.add(list);
     });
 
     _db!
@@ -793,6 +951,14 @@ class FirestoreService {
           .toList();
     }
 
+    final eRaw = _prefs.getString('local_expenses');
+    if (eRaw != null) {
+      final list = jsonDecode(eRaw) as List;
+      _localExpenses = list
+          .map((e) => ExpenseRecord.fromMap(Map<String, dynamic>.from(e)))
+          .toList();
+    }
+
     final cRaw = _prefs.getString('local_closed_days');
     if (cRaw != null) {
       final list = jsonDecode(cRaw) as List;
@@ -824,6 +990,8 @@ class FirestoreService {
         'local_inv', jsonEncode(_localInv.map((e) => e.toMap()).toList()));
     _prefs.setString('local_sales',
         jsonEncode(_localSales.map((e) => e.toMap(forLocal: true)).toList()));
+    _prefs.setString('local_expenses',
+        jsonEncode(_localExpenses.map((e) => e.toMap(forLocal: true)).toList()));
     _prefs.setString(
         'local_closed_days',
         jsonEncode(
@@ -834,6 +1002,7 @@ class FirestoreService {
     _tablesCtrl.add(List.from(_localTables));
     _invCtrl.add(List.from(_localInv));
     _salesCtrl.add(_localSales.where((s) => !s.isClosed).toList());
+    _expensesCtrl.add(List.from(_localExpenses));
     _closedDaysCtrl.add(List.from(_localClosedDays));
     _logsCtrl.add(List.from(_localLogs));
 
@@ -911,14 +1080,59 @@ class FirestoreService {
   List<InventoryItem> get currentInventory => List.from(_localInv);
   List<SaleRecord> get currentSales =>
       _localSales.where((s) => !s.isClosed).toList();
+  List<ExpenseRecord> get currentExpenses => List.from(_localExpenses);
   List<ClosedDaySummary> get currentClosedDays => List.from(_localClosedDays);
   List<AuditLog> get currentLogs => List.from(_localLogs);
 
   Stream<List<GamingTable>> streamTables() => _tablesCtrl.stream;
   Stream<List<InventoryItem>> streamInventory() => _invCtrl.stream;
   Stream<List<SaleRecord>> streamTodaySales() => _salesCtrl.stream;
+  Stream<List<ExpenseRecord>> streamTodayExpenses() => _expensesCtrl.stream;
   Stream<List<ClosedDaySummary>> streamClosedDays() => _closedDaysCtrl.stream;
   Stream<List<AuditLog>> streamAuditLogs() => _logsCtrl.stream;
+
+  // إضافة مصروف يومي يُخصم من مجمل اليوم
+  Future<void> addDailyExpense(
+      {required String title, required double amount}) async {
+    final expense = ExpenseRecord(
+      id: const Uuid().v4(),
+      title: title,
+      amount: amount,
+      timestamp: DateTime.now(),
+    );
+    _localExpenses.insert(0, expense);
+    _saveAndEmitLocal();
+
+    if (useCloud) {
+      try {
+        await _db!.collection('expenses').doc(expense.id).set(expense.toMap());
+      } catch (_) {}
+    }
+    await _recordAudit(
+      title: 'مصروف يومي جديد',
+      message: 'تم إضافة مصروف [$title] بقيمة ${amount.toStringAsFixed(1)} ج.م',
+      beforeVal: 'خصم مصاريف',
+      afterVal: '-${amount.toStringAsFixed(1)} ج.م',
+    );
+  }
+
+  Future<void> deleteDailyExpense(ExpenseRecord expense) async {
+    _localExpenses.removeWhere((e) => e.id == expense.id);
+    _saveAndEmitLocal();
+
+    if (useCloud) {
+      try {
+        await _db!.collection('expenses').doc(expense.id).delete();
+      } catch (_) {}
+    }
+    await _recordAudit(
+      title: 'حذف مصروف يومي',
+      message:
+          'تم حذف مصروف [${expense.title}] (${expense.amount.toStringAsFixed(1)} ج.م)',
+      beforeVal: '-${expense.amount.toStringAsFixed(1)} ج.م',
+      afterVal: 'ملغي',
+    );
+  }
 
   Future<void> addNewTable(
       {required String name,
@@ -1405,10 +1619,12 @@ class FirestoreService {
     );
   }
 
-  Future<void> closeCurrentDayAndReset(
-      {required double drinksRev,
-      required double tableRev,
-      required double grandTotal}) async {
+  Future<void> closeCurrentDayAndReset({
+    required double drinksRev,
+    required double tableRev,
+    required double expensesTotal,
+    required double grandTotal,
+  }) async {
     final now = DateTime.now();
     final dateStr =
         '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
@@ -1436,26 +1652,28 @@ class FirestoreService {
 
     final finalDrinks = drinksRev + extraDrinks;
     final finalTables = tableRev + extraTableRev;
-    final finalGrandTotal = finalDrinks + finalTables;
+    final finalNetTotal = (finalDrinks + finalTables) - expensesTotal;
 
     final summary = ClosedDaySummary(
       id: const Uuid().v4(),
       dateLabel: dateStr,
       drinksRevenue: finalDrinks,
       tablesRevenue: finalTables,
-      grandTotal: finalGrandTotal,
+      expensesTotal: expensesTotal,
+      grandTotal: finalNetTotal,
       closedAt: now,
     );
 
-    if (finalGrandTotal > 0) {
+    if (finalDrinks + finalTables > 0 || expensesTotal > 0) {
       _localClosedDays.insert(0, summary);
     }
     _localSales.clear();
+    _localExpenses.clear();
     _saveAndEmitLocal();
 
     if (useCloud) {
       try {
-        if (finalGrandTotal > 0) {
+        if (finalDrinks + finalTables > 0 || expensesTotal > 0) {
           await _db!.collection('closed_days').add(summary.toMap());
         }
         final tablesSnap = await _db!.collection('tables').get();
@@ -1472,14 +1690,18 @@ class FirestoreService {
         for (final doc in allSalesSnap.docs) {
           await doc.reference.delete();
         }
+        final allExpSnap = await _db!.collection('expenses').get();
+        for (final doc in allExpSnap.docs) {
+          await doc.reference.delete();
+        }
       } catch (_) {}
     }
 
     await _recordAudit(
         title: 'تقفيل اليوم - Joker Cafe',
         message:
-            'تم تقفيل حسابات يوم $dateStr بإجمالي ${finalGrandTotal.toStringAsFixed(1)} ج.م',
-        beforeVal: '${finalGrandTotal.toStringAsFixed(1)} ج.م',
+            'تم تقفيل حسابات يوم $dateStr بصافي ${finalNetTotal.toStringAsFixed(1)} ج.م (بعد خصم مصاريف ${expensesTotal.toStringAsFixed(1)})',
+        beforeVal: '${finalNetTotal.toStringAsFixed(1)} ج.م',
         afterVal: '0.0 ج.م (شيفت جديد)');
   }
 
@@ -1627,6 +1849,79 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
   int _selectedIndex = 0;
   final Map<String, int> _posCart = {};
 
+  void _showManualSyncDialog() async {
+    final localIps = await widget.db.getLocalIpAddresses();
+    final ipCtrl = TextEditingController();
+
+    if (!mounted) return;
+    showDialog(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        title: const Text('حالة الربط والمزامنة بين اللاب والموبايل'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'الأجهزة المتصلة حالياً: ${widget.db.connectedPeersCount}',
+              style: const TextStyle(
+                  fontWeight: FontWeight.bold, color: Color(0xFF00C896)),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              'عنوان IP هذا الجهاز: ${localIps.isEmpty ? "غير متصل بالواي فاي" : localIps.join(" / ")}',
+              style: const TextStyle(fontSize: 13, color: Colors.white70),
+            ),
+            const Divider(height: 20),
+            const Text(
+              'لو الجهازين مش شايفين بعض تلقائي على الواي فاي، اكتب IP الجهاز التاني هنا:',
+              style: TextStyle(fontSize: 12),
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: ipCtrl,
+              decoration: const InputDecoration(
+                hintText: 'مثال: 192.168.1.5',
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              widget.db.forceSyncNow();
+              Navigator.pop(dialogCtx);
+            },
+            child: const Text('بحث ومزامنة الآن'),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF00C896),
+                foregroundColor: Colors.black),
+            onPressed: () async {
+              final ip = ipCtrl.text.trim();
+              Navigator.pop(dialogCtx);
+              if (ip.isNotEmpty) {
+                final ok = await widget.db.connectToPeerManual(ip);
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(
+                      content: Text(ok
+                          ? 'تم الاتصال والمزامنة مع $ip بنجاح!'
+                          : 'تعذر الوصول إلى $ip - تأكد إن الجهازين على نفس الواي فاي'),
+                    ),
+                  );
+                }
+              }
+            },
+            child: const Text('ربط مباشر'),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return StreamBuilder<List<GamingTable>>(
@@ -1641,83 +1936,152 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
               initialData: widget.db.currentSales,
               stream: widget.db.streamTodaySales(),
               builder: (context, salesSnap) {
-                return StreamBuilder<List<AuditLog>>(
-                  initialData: widget.db.currentLogs,
-                  stream: widget.db.streamAuditLogs(),
-                  builder: (context, logsSnap) {
-                    final tables = tablesSnap.data ?? [];
-                    final inventory = invSnap.data ?? [];
-                    final sales = salesSnap.data ?? [];
-                    final logs = logsSnap.data ?? [];
+                return StreamBuilder<List<ExpenseRecord>>(
+                  initialData: widget.db.currentExpenses,
+                  stream: widget.db.streamTodayExpenses(),
+                  builder: (context, expSnap) {
+                    return StreamBuilder<List<AuditLog>>(
+                      initialData: widget.db.currentLogs,
+                      stream: widget.db.streamAuditLogs(),
+                      builder: (context, logsSnap) {
+                        return StreamBuilder<int>(
+                          initialData: widget.db.connectedPeersCount,
+                          stream: widget.db.streamConnectedPeersCount(),
+                          builder: (context, peersSnap) {
+                            final tables = tablesSnap.data ?? [];
+                            final inventory = invSnap.data ?? [];
+                            final sales = salesSnap.data ?? [];
+                            final expenses = expSnap.data ?? [];
+                            final logs = logsSnap.data ?? [];
+                            final peersCount = peersSnap.data ?? 0;
 
-                    final todayTotal = sales.fold<double>(
-                        0.0, (sum, s) => sum + s.totalRevenue);
+                            final grossRevenue = sales.fold<double>(
+                                0.0, (sum, s) => sum + s.totalRevenue);
+                            final totalExpenses = expenses.fold<double>(
+                                0.0, (sum, e) => sum + e.amount);
+                            final netTodayTotal = grossRevenue - totalExpenses;
 
-                    return LayoutBuilder(
-                      builder: (context, constraints) {
-                        final isWideDesktop = constraints.maxWidth >= 900;
+                            return LayoutBuilder(
+                              builder: (context, constraints) {
+                                final isWideDesktop = constraints.maxWidth >= 900;
 
-                        return Scaffold(
-                          appBar: AppBar(
-                            backgroundColor: const Color(0xFF181E2C),
-                            title: Row(
-                              children: [
-                                const Icon(Icons.theater_comedy,
-                                    color: Color(0xFF00C896)),
-                                const SizedBox(width: 10),
-                                const Expanded(
-                                  child: Text('Joker Cafe - لوحة التحكم',
-                                      style: TextStyle(
-                                          fontWeight: FontWeight.bold)),
-                                ),
-                                Container(
-                                  padding: const EdgeInsets.symmetric(
-                                      horizontal: 12, vertical: 6),
-                                  decoration: BoxDecoration(
-                                    color: Colors.teal.withValues(alpha: 0.2),
-                                    borderRadius: BorderRadius.circular(12),
-                                    border: Border.all(
-                                        color: const Color(0xFF00C896)),
+                                return Scaffold(
+                                  appBar: AppBar(
+                                    backgroundColor: const Color(0xFF181E2C),
+                                    title: Row(
+                                      children: [
+                                        const Icon(Icons.theater_comedy,
+                                            color: Color(0xFF00C896)),
+                                        const SizedBox(width: 10),
+                                        const Expanded(
+                                          child: Text('Joker Cafe - لوحة التحكم',
+                                              style: TextStyle(
+                                                  fontWeight: FontWeight.bold)),
+                                        ),
+                                        InkWell(
+                                          onTap: _showManualSyncDialog,
+                                          borderRadius:
+                                              BorderRadius.circular(10),
+                                          child: Container(
+                                            padding: const EdgeInsets.symmetric(
+                                                horizontal: 10, vertical: 5),
+                                            decoration: BoxDecoration(
+                                              color: peersCount > 0
+                                                  ? Colors.green
+                                                      .withValues(alpha: 0.2)
+                                                  : Colors.orange
+                                                      .withValues(alpha: 0.2),
+                                              borderRadius:
+                                                  BorderRadius.circular(10),
+                                              border: Border.all(
+                                                  color: peersCount > 0
+                                                      ? const Color(0xFF00C896)
+                                                      : Colors.orangeAccent),
+                                            ),
+                                            child: Row(
+                                              mainAxisSize: MainAxisSize.min,
+                                              children: [
+                                                Icon(
+                                                  peersCount > 0
+                                                      ? Icons.sync
+                                                      : Icons.sync_problem,
+                                                  size: 16,
+                                                  color: peersCount > 0
+                                                      ? const Color(0xFF00C896)
+                                                      : Colors.orangeAccent,
+                                                ),
+                                                const SizedBox(width: 6),
+                                                Text(
+                                                  peersCount > 0
+                                                      ? 'متصل ($peersCount)'
+                                                      : 'ربط الأجهزة',
+                                                  style: TextStyle(
+                                                    fontSize: 12,
+                                                    fontWeight: FontWeight.bold,
+                                                    color: peersCount > 0
+                                                        ? const Color(0xFF00C896)
+                                                        : Colors.orangeAccent,
+                                                  ),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
+                                        ),
+                                        const SizedBox(width: 8),
+                                        Container(
+                                          padding: const EdgeInsets.symmetric(
+                                              horizontal: 12, vertical: 6),
+                                          decoration: BoxDecoration(
+                                            color: Colors.teal
+                                                .withValues(alpha: 0.2),
+                                            borderRadius:
+                                                BorderRadius.circular(12),
+                                            border: Border.all(
+                                                color: const Color(0xFF00C896)),
+                                          ),
+                                          child: Text(
+                                            'صافي الشيفت: ${netTodayTotal.toStringAsFixed(1)} ج.م',
+                                            style: const TextStyle(
+                                                fontWeight: FontWeight.bold,
+                                                color: Color(0xFF00C896)),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
                                   ),
-                                  child: Text(
-                                    'إجمالي الشيفت: ${todayTotal.toStringAsFixed(1)} ج.م',
-                                    style: const TextStyle(
-                                        fontWeight: FontWeight.bold,
-                                        color: Color(0xFF00C896)),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                          body: isWideDesktop
-                              ? _buildWindowsDesktopView(
-                                  tables, inventory, sales, logs)
-                              : _buildAndroidMobileView(
-                                  tables, inventory, sales, logs),
-                          bottomNavigationBar: isWideDesktop
-                              ? null
-                              : NavigationBar(
-                                  selectedIndex: _selectedIndex,
-                                  onDestinationSelected: (idx) =>
-                                      setState(() => _selectedIndex = idx),
-                                  destinations: const [
-                                    NavigationDestination(
-                                        icon: Icon(Icons.table_bar),
-                                        label: 'الترابيزات'),
-                                    NavigationDestination(
-                                        icon: Icon(Icons.point_of_sale),
-                                        label: 'الكاشير'),
-                                    NavigationDestination(
-                                        icon: Icon(Icons.inventory_2),
-                                        label: 'المخزن'),
-                                    NavigationDestination(
-                                        icon: Icon(Icons.bar_chart),
-                                        label: 'تقفيل اليوم'),
-                                    NavigationDestination(
-                                        icon: Icon(Icons.history),
-                                        label: 'التعديلات'),
-                                  ],
-                                ),
+                                  body: isWideDesktop
+                                      ? _buildWindowsDesktopView(tables,
+                                          inventory, sales, expenses, logs)
+                                      : _buildAndroidMobileView(tables,
+                                          inventory, sales, expenses, logs),
+                                  bottomNavigationBar: isWideDesktop
+                                      ? null
+                                      : NavigationBar(
+                                          selectedIndex: _selectedIndex,
+                                          onDestinationSelected: (idx) =>
+                                              setState(() => _selectedIndex = idx),
+                                          destinations: const [
+                                            NavigationDestination(
+                                                icon: Icon(Icons.table_bar),
+                                                label: 'الترابيزات'),
+                                            NavigationDestination(
+                                                icon: Icon(Icons.point_of_sale),
+                                                label: 'الكاشير'),
+                                            NavigationDestination(
+                                                icon: Icon(Icons.inventory_2),
+                                                label: 'المخزن'),
+                                            NavigationDestination(
+                                                icon: Icon(Icons.bar_chart),
+                                                label: 'تقفيل اليوم'),
+                                            NavigationDestination(
+                                                icon: Icon(Icons.history),
+                                                label: 'التعديلات'),
+                                          ],
+                                        ),
+                                );
+                              },
+                            );
+                          },
                         );
                       },
                     );
@@ -1735,6 +2099,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
       List<GamingTable> tables,
       List<InventoryItem> inventory,
       List<SaleRecord> sales,
+      List<ExpenseRecord> expenses,
       List<AuditLog> logs) {
     final desktopIndex = _selectedIndex > 4 ? 0 : _selectedIndex;
     return Row(
@@ -1754,7 +2119,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                 icon: Icon(Icons.inventory_2), label: Text('المخزن')),
             NavigationRailDestination(
                 icon: Icon(Icons.assessment),
-                label: Text('تقفيل اليوم والتقارير')),
+                label: Text('تقفيل اليوم والمصاريف')),
             NavigationRailDestination(
                 icon: Icon(Icons.history), label: Text('سجل العمليات')),
           ],
@@ -1782,7 +2147,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                 case 2:
                   return _buildInventorySection(inventory);
                 case 3:
-                  return _buildReportsSection(sales, logs);
+                  return _buildReportsSection(sales, expenses, logs);
                 case 4:
                   return _buildAuditLogsSection(logs);
                 default:
@@ -1799,6 +2164,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
       List<GamingTable> tables,
       List<InventoryItem> inventory,
       List<SaleRecord> sales,
+      List<ExpenseRecord> expenses,
       List<AuditLog> logs) {
     switch (_selectedIndex) {
       case 0:
@@ -1808,7 +2174,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
       case 2:
         return _buildInventorySection(inventory);
       case 3:
-        return _buildReportsSection(sales, logs);
+        return _buildReportsSection(sales, expenses, logs);
       case 4:
         return _buildAuditLogsSection(logs);
       default:
@@ -2266,14 +2632,18 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
     );
   }
 
-  Widget _buildReportsSection(List<SaleRecord> sales, List<AuditLog> logs) {
+  Widget _buildReportsSection(
+      List<SaleRecord> sales, List<ExpenseRecord> expenses, List<AuditLog> logs) {
     double drinksRev = 0;
     double tableRev = 0;
     for (final s in sales) {
       drinksRev += s.drinksRevenue;
       tableRev += s.timeRevenue;
     }
-    final grandTotal = drinksRev + tableRev;
+    final totalIncome = drinksRev + tableRev;
+    final totalExpenses =
+        expenses.fold<double>(0.0, (sum, e) => sum + e.amount);
+    final netTotal = totalIncome - totalExpenses;
 
     return StreamBuilder<List<ClosedDaySummary>>(
       initialData: widget.db.currentClosedDays,
@@ -2292,7 +2662,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                 padding: const EdgeInsets.all(16),
                 child: Column(
                   children: [
-                    const Text('تقفيل الشيفت واليوم الحالي',
+                    const Text('ملخص الشيفت والمصاريف اليومية',
                         style: TextStyle(
                             fontSize: 16,
                             fontWeight: FontWeight.bold,
@@ -2300,26 +2670,96 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                     const SizedBox(height: 10),
                     Text('إيراد المشاريب: ${drinksRev.toStringAsFixed(1)} ج.م'),
                     Text('إيراد الترابيزات: ${tableRev.toStringAsFixed(1)} ج.م'),
+                    Text('إجمالي الإيرادات: ${totalIncome.toStringAsFixed(1)} ج.م',
+                        style: const TextStyle(fontWeight: FontWeight.bold)),
+                    Text(
+                        'إجمالي المصاريف اليومية: -${totalExpenses.toStringAsFixed(1)} ج.م',
+                        style: const TextStyle(
+                            color: Colors.redAccent,
+                            fontWeight: FontWeight.bold)),
                     const Divider(),
-                    Text('الإجمالي الكلي: ${grandTotal.toStringAsFixed(1)} ج.م',
+                    Text(
+                        'الصافي بعد خصم المصاريف: ${netTotal.toStringAsFixed(1)} ج.م',
                         style: const TextStyle(
                             fontSize: 18,
                             fontWeight: FontWeight.bold,
                             color: Colors.amber)),
                     const SizedBox(height: 14),
-                    ElevatedButton.icon(
-                      style: ElevatedButton.styleFrom(
-                          backgroundColor: Colors.green,
-                          foregroundColor: Colors.white),
-                      onPressed: () => _confirmCloseDayDialog(
-                          drinksRev, tableRev, grandTotal),
-                      icon: const Icon(Icons.lock_clock),
-                      label: const Text('تقفيل اليوم وتصفير الشيفت'),
+                    Wrap(
+                      spacing: 10,
+                      runSpacing: 10,
+                      alignment: Alignment.center,
+                      children: [
+                        ElevatedButton.icon(
+                          style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.amber.shade700,
+                              foregroundColor: Colors.black),
+                          onPressed: _showAddExpenseDialog,
+                          icon: const Icon(Icons.money_off),
+                          label: const Text('إضافة مصروف يومي',
+                              style: TextStyle(fontWeight: FontWeight.bold)),
+                        ),
+                        ElevatedButton.icon(
+                          style: ElevatedButton.styleFrom(
+                              backgroundColor: Colors.green,
+                              foregroundColor: Colors.white),
+                          onPressed: () => _confirmCloseDayDialog(
+                              drinksRev, tableRev, totalExpenses, netTotal),
+                          icon: const Icon(Icons.lock_clock),
+                          label: const Text('تقفيل اليوم وتصفير الشيفت'),
+                        ),
+                      ],
                     ),
                   ],
                 ),
               ),
             ),
+            const SizedBox(height: 20),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Text('مصاريف اليوم (تُخصم من المجمل):',
+                    style:
+                        TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                TextButton.icon(
+                  onPressed: _showAddExpenseDialog,
+                  icon: const Icon(Icons.add, color: Colors.amber),
+                  label: const Text('مصروف جديد',
+                      style: TextStyle(color: Colors.amber)),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            if (expenses.isEmpty)
+              const Text('مفيش مصاريف مسجلة النهاردة.',
+                  style: TextStyle(color: Colors.white60))
+            else
+              ...expenses.map((exp) => Card(
+                    color: const Color(0xFF1D2331),
+                    child: ListTile(
+                      leading: const Icon(Icons.remove_circle,
+                          color: Colors.redAccent),
+                      title: Text(exp.title,
+                          style: const TextStyle(fontWeight: FontWeight.bold)),
+                      subtitle: Text(
+                          intl.DateFormat('hh:mm a').format(exp.timestamp)),
+                      trailing: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text('-${exp.amount.toStringAsFixed(1)} ج.م',
+                              style: const TextStyle(
+                                  color: Colors.redAccent,
+                                  fontWeight: FontWeight.bold)),
+                          IconButton(
+                            icon: const Icon(Icons.delete_outline,
+                                color: Colors.white54),
+                            onPressed: () =>
+                                widget.db.deleteDailyExpense(exp),
+                          ),
+                        ],
+                      ),
+                    ),
+                  )),
             const SizedBox(height: 24),
             const Text('سجل الأيام السابقة المتقفلة:',
                 style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
@@ -2335,7 +2775,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                               fontWeight: FontWeight.bold,
                               color: Colors.cyanAccent)),
                       subtitle: Text(
-                          'مشاريب: ${day.drinksRevenue.toStringAsFixed(0)} | ترابيزات: ${day.tablesRevenue.toStringAsFixed(0)}'),
+                          'مشاريب: ${day.drinksRevenue.toStringAsFixed(0)} | ترابيزات: ${day.tablesRevenue.toStringAsFixed(0)} | مصاريف: -${day.expensesTotal.toStringAsFixed(0)}'),
                       trailing: Text('${day.grandTotal.toStringAsFixed(1)} ج.م',
                           style: const TextStyle(
                               fontWeight: FontWeight.bold,
@@ -2345,6 +2785,60 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
           ],
         );
       },
+    );
+  }
+
+  void _showAddExpenseDialog() {
+    final titleCtrl = TextEditingController();
+    final amountCtrl = TextEditingController();
+
+    showDialog(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        title: const Text('إضافة مصروف يومي'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: titleCtrl,
+              autofocus: true,
+              decoration: const InputDecoration(
+                labelText: 'بيان المصروف (مثال: ثلج، بن، صيانة، نظافة)',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: amountCtrl,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(
+                labelText: 'المبلغ (ج.م)',
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogCtx),
+            child: const Text('إلغاء'),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.amber.shade700,
+                foregroundColor: Colors.black),
+            onPressed: () async {
+              final title = titleCtrl.text.trim();
+              final amount = double.tryParse(amountCtrl.text) ?? 0.0;
+              if (title.isEmpty || amount <= 0) return;
+              Navigator.pop(dialogCtx);
+              await widget.db.addDailyExpense(title: title, amount: amount);
+            },
+            child: const Text('خصم من المجمل',
+                style: TextStyle(fontWeight: FontWeight.bold)),
+          ),
+        ],
+      ),
     );
   }
 
@@ -2746,13 +3240,14 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
     );
   }
 
-  void _confirmCloseDayDialog(double dRev, double tRev, double gTotal) {
+  void _confirmCloseDayDialog(
+      double dRev, double tRev, double expensesTotal, double netTotal) {
     showDialog(
       context: context,
       builder: (dialogCtx) => AlertDialog(
         title: const Text('تقفيل اليوم'),
         content: Text(
-            'هل تريد تقفيل اليوم بإجمالي ${gTotal.toStringAsFixed(1)} ج.م وتصفير الشيفت؟'),
+            'هل تريد تقفيل اليوم بصافي ${netTotal.toStringAsFixed(1)} ج.م (بعد خصم مصاريف ${expensesTotal.toStringAsFixed(1)} ج.م) وتصفير الشيفت؟'),
         actions: [
           TextButton(
               onPressed: () => Navigator.pop(dialogCtx),
@@ -2761,7 +3256,11 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
             onPressed: () async {
               Navigator.pop(dialogCtx);
               await widget.db.closeCurrentDayAndReset(
-                  drinksRev: dRev, tableRev: tRev, grandTotal: gTotal);
+                drinksRev: dRev,
+                tableRev: tRev,
+                expensesTotal: expensesTotal,
+                grandTotal: netTotal,
+              );
             },
             child: const Text('نعم، قفّل'),
           ),
