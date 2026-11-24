@@ -20,9 +20,9 @@ jobs:
           Move-Item -Path "main_backup.dart" -Destination "lib/main.dart" -Force
           if (Test-Path "test/widget_test.dart") { Remove-Item "test/widget_test.dart" -Force }
           if (Test-Path "android/app/build.gradle.kts") {
-            (Get-Content "android/app/build.gradle.kts" -Raw) -replace 'minSdk\s*=\s*flutter\.minSdkVersion', 'minSdk = 24' | Set-Content "android/app/build.gradle.kts" -NoNewline
+            (Get-Content "android/app/build.gradle.kts" -Raw) -replace 'minSdk\s*=\s*flutter\.minSdkVersion', 'minSdk = 24' -replace 'com\.example\.joker_cafe_pos', 'com.cafepos.cafe_pos' | Set-Content "android/app/build.gradle.kts" -NoNewline
           } elseif (Test-Path "android/app/build.gradle") {
-            (Get-Content "android/app/build.gradle" -Raw) -replace 'minSdkVersion\s+flutter\.minSdkVersion', 'minSdkVersion 24' | Set-Content "android/app/build.gradle" -NoNewline
+            (Get-Content "android/app/build.gradle" -Raw) -replace 'minSdkVersion\s+flutter\.minSdkVersion', 'minSdkVersion 24' -replace 'com\.example\.joker_cafe_pos', 'com.cafepos.cafe_pos' | Set-Content "android/app/build.gradle" -NoNewline
           }
           flutter pub get
           dart run rename_app:main all="Joker Cafe"
@@ -48,8 +48,10 @@ jobs:
           rm -f test/widget_test.dart
           if [ -f android/app/build.gradle.kts ]; then
             sed -i 's/minSdk *= *flutter\.minSdkVersion/minSdk = 24/' android/app/build.gradle.kts
+            sed -i 's/com\.example\.joker_cafe_pos/com.cafepos.cafe_pos/g' android/app/build.gradle.kts
           elif [ -f android/app/build.gradle ]; then
             sed -i 's/minSdkVersion *= *flutter\.minSdkVersion/minSdkVersion 24/' android/app/build.gradle
+            sed -i 's/com\.example\.joker_cafe_pos/com.cafepos.cafe_pos/g' android/app/build.gradle
           fi
           flutter pub get
           dart run rename_app:main all="Joker Cafe"

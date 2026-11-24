@@ -40,8 +40,9 @@ was erased. That is why your data disappeared.
 ## Step 2 — Add the Android app
 
 1. In the project, click the **Android** icon (or **Add app → Android**)
-2. **Android package name:** `com.example.joker_cafe_pos`
-   (this is the id the build workflow generates)
+2. **Android package name:** `com.cafepos.cafe_pos`
+   (this is the id the build workflow generates; it must match the existing
+   Firebase Android app exactly)
 3. Nickname: `Joker Cafe Android`
 4. Click **Register app**
 5. Skip the download steps — you do not need `google-services.json`,

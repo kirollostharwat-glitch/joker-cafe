@@ -5,7 +5,7 @@
 //   Firebase Console -> Project settings (gear icon) -> Your apps
 //
 // You must register TWO apps inside the same Firebase project:
-//   1) Android app -> package name: com.example.joker_cafe_pos
+//   1) Android app -> package name: com.cafepos.cafe_pos
 //   2) Web app     -> used by the Windows build (this is how Firebase's
 //                     official Windows support works: Windows reuses the
 //                     Web app id).
