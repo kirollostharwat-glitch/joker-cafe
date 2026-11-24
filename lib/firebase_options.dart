@@ -34,21 +34,21 @@ class DefaultFirebaseOptions {
 
   // ---- Android app --------------------------------------------------------
   static const FirebaseOptions android = FirebaseOptions(
-    apiKey: 'PASTE_ANDROID_API_KEY',
-    appId: 'PASTE_ANDROID_APP_ID',
-    messagingSenderId: 'PASTE_MESSAGING_SENDER_ID',
-    projectId: 'PASTE_PROJECT_ID',
-    storageBucket: 'PASTE_PROJECT_ID.firebasestorage.app',
+    apiKey: 'AIzaSyC38YsdDlepr22CJOieE0mrtBpHm25sYqg',
+    appId: '1:600561749366:android:c5a909e7476728911bbe57',
+    messagingSenderId: '600561749366',
+    projectId: 'joker-cafe-ddc53',
+    storageBucket: 'joker-cafe-ddc53.firebasestorage.app',
   );
 
   // ---- Web app (also used by the Windows build) ---------------------------
   static const FirebaseOptions web = FirebaseOptions(
-    apiKey: 'PASTE_WEB_API_KEY',
-    appId: 'PASTE_WEB_APP_ID',
-    messagingSenderId: 'PASTE_MESSAGING_SENDER_ID',
-    projectId: 'PASTE_PROJECT_ID',
-    authDomain: 'PASTE_PROJECT_ID.firebaseapp.com',
-    storageBucket: 'PASTE_PROJECT_ID.firebasestorage.app',
+    apiKey: 'AIzaSyAnI6IJg2RLK3Tv4ewLeBlqwl-VX5e4-ow',
+    appId: '1:600561749366:web:362b796e0eddd43a1bbe57',
+    messagingSenderId: '600561749366',
+    projectId: 'joker-cafe-ddc53',
+    authDomain: 'joker-cafe-ddc53.firebaseapp.com',
+    storageBucket: 'joker-cafe-ddc53.firebasestorage.app',
   );
 
   // Windows reuses the Web app registration.
