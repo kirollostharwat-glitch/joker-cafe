@@ -27,6 +27,9 @@ jobs:
           flutter pub get
           dart run rename_app:main all="Joker Cafe"
           if (Test-Path "joker.png") { dart run flutter_launcher_icons }
+          if (Test-Path "windows/CMakeLists.txt") {
+            (Get-Content "windows/CMakeLists.txt" -Raw) -replace '/W4 /WX /wd4100', '/W4 /WX /wd4100 /wd4238' | Set-Content "windows/CMakeLists.txt" -NoNewline
+          }
           flutter build windows --release
       - uses: actions/upload-artifact@v4
         with:
