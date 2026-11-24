@@ -1,10 +1,10 @@
 name: joker_cafe_pos
 description: Joker Cafe - نظام إدارة كافيه وبلياردو وبينج بونج
 publish_to: 'none'
-version: 1.0.0+1
+version: 1.1.0+2
 
 environment:
-  sdk: '>=3.2.0 <4.0.0'
+  sdk: '>=3.6.0 <4.0.0'
 
 dependencies:
   flutter:
@@ -12,8 +12,9 @@ dependencies:
   flutter_localizations:
     sdk: flutter
 
-  firebase_core: ^3.6.0
-  cloud_firestore: ^5.4.4
+  firebase_core: ^4.15.2
+  cloud_firestore: ^6.10.2
+  firebase_auth: ^6.7.1
   connectivity_plus: ^6.0.5
   provider: ^6.1.2
   uuid: ^4.5.1

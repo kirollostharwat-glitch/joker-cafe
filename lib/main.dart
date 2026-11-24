@@ -1,9 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:io';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
+import 'firebase_options.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
@@ -485,24 +486,86 @@ class NotificationService {
 }
 
 // =============================================================================
-// 3. FIRESTORE + ENHANCED WINDOWS/ANDROID LAN P2P REAL-TIME SYNC SERVICE
+// 3. CLOUD SYNC SERVICE (Firebase Firestore: real-time + offline-safe writes)
 // =============================================================================
+
+class SyncStatus {
+  final bool cloudReady;
+  final bool online;
+  final int pendingWrites;
+  final bool syncing;
+  final String? lastError;
+
+  const SyncStatus({
+    required this.cloudReady,
+    required this.online,
+    required this.pendingWrites,
+    required this.syncing,
+    this.lastError,
+  });
+
+  bool get isSynced =>
+      cloudReady && online && pendingWrites == 0 && !syncing;
+
+  bool get hasUnsynced => pendingWrites > 0 || syncing;
+}
+
+class _PendingOp {
+  final String collection;
+  final String docId;
+  final Map<String, dynamic>? data;
+  final bool merge;
+  int attempts;
+
+  _PendingOp({
+    required this.collection,
+    required this.docId,
+    this.data,
+    this.merge = true,
+    this.attempts = 0,
+  });
+
+  Map<String, dynamic> toJson() => {
+        'c': collection,
+        'd': docId,
+        'data': data,
+        'merge': merge,
+        'a': attempts,
+      };
+
+  factory _PendingOp.fromJson(Map<String, dynamic> j) => _PendingOp(
+        collection: j['c'] as String,
+        docId: j['d'] as String,
+        data: j['data'] == null
+            ? null
+            : Map<String, dynamic>.from(j['data'] as Map),
+        merge: j['merge'] as bool? ?? true,
+        attempts: j['a'] as int? ?? 0,
+      );
+}
 
 class FirestoreService {
   FirebaseFirestore? _db;
+  FirebaseAuth? _auth;
   bool useCloud = false;
   late SharedPreferences _prefs;
   late String deviceId;
   bool _isInitialAuditLoad = true;
+  bool _seedChecked = false;
+  bool _seeding = false;
+  bool _listenersStarted = false;
+  bool _firebaseReady = false;
+  bool _cloudInitializing = false;
 
-  ServerSocket? _tcpServer;
-  RawDatagramSocket? _udpSocket;
-  Timer? _discoveryTimer;
-  final List<Socket> _peerSockets = [];
-  final Set<String> _connectedPeerIps = {};
-  static const int _syncTcpPort = 45454;
-  static const int _syncUdpPort = 45455;
-  int _lastStateTimestamp = 0;
+  final List<_PendingOp> _outbox = [];
+  final List<Map<String, dynamic>> _deadLetters = [];
+  // Documents with local edits not yet acknowledged by Firestore. Incoming
+  // snapshots are overlaid with these so a stale cached snapshot can never
+  // visually replace an offline edit before it is uploaded.
+  final Map<String, Map<String, Map<String, dynamic>?>> _pendingDocs = {};
+  bool _flushing = false;
+  bool _online = true;
+  String? _lastError;
 
   final _tablesCtrl = StreamController<List<GamingTable>>.broadcast();
   final _invCtrl = StreamController<List<InventoryItem>>.broadcast();
@@ -510,7 +573,7 @@ class FirestoreService {
   final _expensesCtrl = StreamController<List<ExpenseRecord>>.broadcast();
   final _closedDaysCtrl = StreamController<List<ClosedDaySummary>>.broadcast();
   final _logsCtrl = StreamController<List<AuditLog>>.broadcast();
-  final _peersCountCtrl = StreamController<int>.broadcast();
+  final _statusCtrl = StreamController<SyncStatus>.broadcast();
 
   List<GamingTable> _localTables = [];
   List<InventoryItem> _localInv = [];
@@ -519,8 +582,15 @@ class FirestoreService {
   List<ClosedDaySummary> _localClosedDays = [];
   List<AuditLog> _localLogs = [];
 
-  int get connectedPeersCount => _peerSockets.length;
-  Stream<int> streamConnectedPeersCount() => _peersCountCtrl.stream;
+  SyncStatus get currentSyncStatus => SyncStatus(
+        cloudReady: useCloud,
+        online: _online,
+        pendingWrites: _outbox.length,
+        syncing: _flushing,
+        lastError: _lastError,
+      );
+
+  Stream<SyncStatus> streamSyncStatus() => _statusCtrl.stream;
 
   Future<void> initAndSeed({required bool firebaseReady}) async {
     _prefs = await SharedPreferences.getInstance();
@@ -530,356 +600,575 @@ class FirestoreService {
       await _prefs.setString('device_instance_id', storedId);
     }
     deviceId = storedId;
-    _lastStateTimestamp = _prefs.getInt('last_state_ts') ?? 0;
 
+    // The mirror must be loaded first: rebuilding the pending-write overlay
+    // from disk needs the full local documents to fill in partial updates.
+    _loadLocalMirror();
+    _loadOutbox();
+    _loadDeadLetters();
+    _watchConnectivity();
+
+    _firebaseReady = firebaseReady;
     if (firebaseReady) {
+      await _initCloud();
+    }
+
+    Timer.periodic(const Duration(seconds: 30), (_) {
+      if (_online) _resumeSync();
+    });
+
+    _emitStatus();
+  }
+
+  Future<void> _initCloud() async {
+    if (_cloudInitializing || useCloud || !_firebaseReady) return;
+    _cloudInitializing = true;
+    try {
+      _db ??= FirebaseFirestore.instance;
       try {
-        _db = FirebaseFirestore.instance;
         _db!.settings = const Settings(
           persistenceEnabled: true,
           cacheSizeBytes: Settings.CACHE_SIZE_UNLIMITED,
         );
-        useCloud = true;
-      } catch (_) {
-        useCloud = false;
+      } catch (_) {}
+
+      _auth ??= FirebaseAuth.instance;
+      if (_auth!.currentUser == null) {
+        await _auth!.signInAnonymously().timeout(const Duration(seconds: 25));
       }
+
+      useCloud = true;
+      _lastError = null;
+      // Listen and replay the outbox immediately; seeding the cloud from the
+      // local mirror is done in the background so a slow network cannot delay
+      // the app from becoming usable.
+      _startCloudListeners();
+      _kick();
+      unawaited(_seedCloudIfEmpty());
+    } catch (e) {
+      // Offline at first launch (no cached anonymous user yet) lands here.
+      // It is retried automatically as soon as connectivity comes back.
+      _lastError = _friendlyError(e);
+    } finally {
+      _cloudInitializing = false;
+      _emitStatus();
     }
-
-    _loadAndSeedLocalData();
-
-    if (useCloud) {
-      await _seedCloudDataIfNeeded();
-      _listenToCloudRealtimeStreams();
-      _listenToAuditLogsForNotifications();
-    }
-
-    await _ensureWindowsFirewallRule();
-    await _startAutoLanSyncEngine();
   }
 
-  Future<void> _ensureWindowsFirewallRule() async {
-    if (!Platform.isWindows) return;
+  void _watchConnectivity() {
     try {
-      await Process.run('netsh', [
-        'advfirewall',
-        'firewall',
-        'add',
-        'rule',
-        'name=JokerCafeSyncTCP',
-        'dir=in',
-        'action=allow',
-        'protocol=TCP',
-        'localport=$_syncTcpPort'
-      ]);
-      await Process.run('netsh', [
-        'advfirewall',
-        'firewall',
-        'add',
-        'rule',
-        'name=JokerCafeSyncUDP',
-        'dir=in',
-        'action=allow',
-        'protocol=UDP',
-        'localport=$_syncUdpPort'
-      ]);
-    } catch (_) {}
-  }
+      Connectivity().checkConnectivity().then((results) {
+        _online = results.any((r) => r != ConnectivityResult.none);
+        _emitStatus();
+        _resumeSync();
+      }).catchError((_) {});
 
-  Future<List<String>> getLocalIpAddresses() async {
-    final List<String> ips = [];
-    try {
-      final interfaces = await NetworkInterface.list(
-          includeLoopback: false, type: InternetAddressType.IPv4);
-      for (final iface in interfaces) {
-        for (final addr in iface.addresses) {
-          ips.add(addr.address);
-        }
-      }
-    } catch (_) {}
-    return ips;
-  }
-
-  Future<void> _startAutoLanSyncEngine() async {
-    try {
-      _tcpServer = await ServerSocket.bind(InternetAddress.anyIPv4, _syncTcpPort,
-          shared: true);
-      _tcpServer!.listen(_handleIncomingPeerSocket);
-    } catch (_) {}
-
-    try {
-      _udpSocket = await RawDatagramSocket.bind(
-          InternetAddress.anyIPv4, _syncUdpPort,
-          reuseAddress: true);
-      _udpSocket!.broadcastEnabled = true;
-      _udpSocket!.listen((RawSocketEvent event) {
-        if (event == RawSocketEvent.read) {
-          final dg = _udpSocket!.receive();
-          if (dg == null) return;
-          final msg = utf8.decode(dg.data, allowMalformed: true);
-          if (msg.startsWith('JOKER_SYNC:')) {
-            final senderDeviceId = msg.substring('JOKER_SYNC:'.length).trim();
-            if (senderDeviceId != deviceId) {
-              final peerIp = dg.address.address;
-              if (!_connectedPeerIps.contains(peerIp)) {
-                connectToPeerManual(peerIp);
-              }
-            }
-          }
-        }
-      });
-
-      _broadcastDiscoveryPackets();
-      _discoveryTimer = Timer.periodic(const Duration(seconds: 2), (_) {
-        _broadcastDiscoveryPackets();
+      Connectivity().onConnectivityChanged.listen((results) {
+        _online = results.any((r) => r != ConnectivityResult.none);
+        _emitStatus();
+        _resumeSync();
       });
     } catch (_) {}
-
-    final savedPeerIp = _prefs.getString('last_peer_ip');
-    if (savedPeerIp != null && savedPeerIp.isNotEmpty) {
-      connectToPeerManual(savedPeerIp);
-    }
   }
 
-  Future<void> _broadcastDiscoveryPackets() async {
-    if (_udpSocket == null) return;
-    final packet = utf8.encode('JOKER_SYNC:$deviceId');
+  // Called whenever the device (re)gains a network connection.
+  void _resumeSync() {
+    if (!_online) return;
+    if (!useCloud) {
+      // Firebase may have failed to initialise while offline (for example on
+      // the very first launch, before an anonymous user was cached).
+      if (_firebaseReady) unawaited(_initCloud());
+      return;
+    }
+    unawaited(_seedCloudIfEmpty());
+    _kick();
+  }
 
+  Future<void> _seedCloudIfEmpty() async {
+    if (_seedChecked || _seeding || _db == null || !useCloud) return;
+    _seeding = true;
     try {
-      _udpSocket!
-          .send(packet, InternetAddress('255.255.255.255'), _syncUdpPort);
-    } catch (_) {}
+      final tablesSnap = await _db!
+          .collection('tables')
+          .limit(1)
+          .get()
+          .timeout(const Duration(seconds: 15));
+      if (tablesSnap.metadata.isFromCache) return;
+      _seedChecked = true;
 
-    try {
-      final interfaces = await NetworkInterface.list(
-          includeLoopback: false, type: InternetAddressType.IPv4);
-      for (final iface in interfaces) {
-        for (final addr in iface.addresses) {
-          final parts = addr.address.split('.');
-          if (parts.length == 4) {
-            final subnetBroadcast = '${parts[0]}.${parts[1]}.${parts[2]}.255';
-            try {
-              _udpSocket!.send(
-                  packet, InternetAddress(subnetBroadcast), _syncUdpPort);
-            } catch (_) {}
-          }
+      if (tablesSnap.docs.isEmpty) {
+        for (final t in _localTables) {
+          await _enqueue('tables', t.id, t.toMap(forLocal: true),
+              merge: false);
         }
       }
-    } catch (_) {}
-  }
 
-  Future<bool> connectToPeerManual(String ip) async {
-    final cleanIp = ip.trim();
-    if (cleanIp.isEmpty) return false;
-    if (_connectedPeerIps.contains(cleanIp)) return true;
+      if (await _isCollectionEmpty('inventory')) {
+        for (final item in _localInv) {
+          await _enqueue('inventory', item.id, item.toMap(), merge: false);
+        }
+      }
 
-    _connectedPeerIps.add(cleanIp);
-    try {
-      final socket = await Socket.connect(cleanIp, _syncTcpPort,
-          timeout: const Duration(seconds: 3));
-      await _prefs.setString('last_peer_ip', cleanIp);
-      _setupPeerSocket(socket);
-      return true;
+      if (await _isCollectionEmpty('sales')) {
+        for (final sale in _localSales) {
+          await _enqueue('sales', sale.id, sale.toMap(forLocal: true),
+              merge: false);
+        }
+      }
+
+      if (await _isCollectionEmpty('expenses')) {
+        for (final expense in _localExpenses) {
+          await _enqueue('expenses', expense.id,
+              expense.toMap(forLocal: true),
+              merge: false);
+        }
+      }
+
+      if (await _isCollectionEmpty('closed_days')) {
+        for (final day in _localClosedDays) {
+          await _enqueue('closed_days', day.id, day.toMap(forLocal: true),
+              merge: false);
+        }
+      }
+
+      if (await _isCollectionEmpty('audit_logs')) {
+        for (final log in _localLogs.take(200)) {
+          await _enqueue('audit_logs', log.id, log.toMap(forLocal: true),
+              merge: false);
+        }
+      }
+
+      _kick();
     } catch (_) {
-      _connectedPeerIps.remove(cleanIp);
-      return false;
+    } finally {
+      _seeding = false;
     }
   }
 
-  void _handleIncomingPeerSocket(Socket socket) {
-    final ip = socket.remoteAddress.address;
-    _connectedPeerIps.add(ip);
-    _prefs.setString('last_peer_ip', ip);
-    _setupPeerSocket(socket);
+  Future<bool> _isCollectionEmpty(String name) async {
+    final snap = await _db!
+        .collection(name)
+        .limit(1)
+        .get()
+        .timeout(const Duration(seconds: 15));
+    if (snap.metadata.isFromCache) return false;
+    return snap.docs.isEmpty;
   }
 
-  void _setupPeerSocket(Socket socket) {
-    _peerSockets.add(socket);
-    _peersCountCtrl.add(_peerSockets.length);
-    _sendSyncPayloadToSocket(socket);
-
-    utf8.decoder
-        .bind(socket)
-        .transform(const LineSplitter())
-        .listen((String line) {
-      if (line.trim().isNotEmpty) {
-        _handleReceivedSyncLine(line);
-      }
-    }, onDone: () {
-      _peerSockets.remove(socket);
-      _connectedPeerIps.remove(socket.remoteAddress.address);
-      _peersCountCtrl.add(_peerSockets.length);
-    }, onError: (_) {
-      _peerSockets.remove(socket);
-      _connectedPeerIps.remove(socket.remoteAddress.address);
-      _peersCountCtrl.add(_peerSockets.length);
-    });
-  }
-
-  void _sendSyncPayloadToSocket(Socket s) {
-    try {
-      final payload = jsonEncode({
-        'type': 'FULL_SYNC',
-        'senderId': deviceId,
-        'ts': _lastStateTimestamp,
-        'tables': _localTables.map((e) => e.toMap(forLocal: true)).toList(),
-        'inv': _localInv.map((e) => e.toMap()).toList(),
-        'sales': _localSales.map((e) => e.toMap(forLocal: true)).toList(),
-        'expenses': _localExpenses.map((e) => e.toMap(forLocal: true)).toList(),
-        'closedDays':
-            _localClosedDays.map((e) => e.toMap(forLocal: true)).toList(),
-        'logs':
-            _localLogs.take(100).map((e) => e.toMap(forLocal: true)).toList(),
-      });
-      s.write('$payload\n');
-    } catch (_) {}
-  }
-
-  void forceSyncNow() {
-    _broadcastDiscoveryPackets();
-    _broadcastLanSync();
-  }
-
-  void _broadcastLanSync({AuditLog? latestLog}) {
-    if (_peerSockets.isEmpty) return;
-    final payload = jsonEncode({
-      'type': 'FULL_SYNC',
-      'senderId': deviceId,
-      'ts': _lastStateTimestamp,
-      'tables': _localTables.map((e) => e.toMap(forLocal: true)).toList(),
-      'inv': _localInv.map((e) => e.toMap()).toList(),
-      'sales': _localSales.map((e) => e.toMap(forLocal: true)).toList(),
-      'expenses': _localExpenses.map((e) => e.toMap(forLocal: true)).toList(),
-      'closedDays':
-          _localClosedDays.map((e) => e.toMap(forLocal: true)).toList(),
-      'logs':
-          _localLogs.take(100).map((e) => e.toMap(forLocal: true)).toList(),
-      'alertTitle': latestLog?.title,
-      'alertBody': latestLog?.message,
-    });
-
-    for (final s in List<Socket>.from(_peerSockets)) {
-      try {
-        s.write('$payload\n');
-      } catch (_) {
-        _peerSockets.remove(s);
-        _peersCountCtrl.add(_peerSockets.length);
-      }
-    }
-  }
-
-  void _handleReceivedSyncLine(String line) {
-    try {
-      final decoded = jsonDecode(line);
-      if (decoded is! Map) return;
-      final map = Map<String, dynamic>.from(decoded);
-      if (map['type'] != 'FULL_SYNC') return;
-      if (map['senderId'] == deviceId) return;
-
-      final incomingTs = (map['ts'] ?? 0) as int;
-      if (incomingTs < _lastStateTimestamp) {
-        _broadcastLanSync();
+  void _startCloudListeners() {
+    if (_listenersStarted) return;
+    _listenersStarted = true;
+    _db!
+        .collection('tables')
+        .snapshots(includeMetadataChanges: true)
+        .listen((snap) {
+      if (snap.docs.isEmpty &&
+          snap.metadata.isFromCache &&
+          _localTables.isNotEmpty) {
         return;
       }
+      _localTables =
+          _withPending(snap, 'tables', (d, id) => GamingTable.fromMap(d, id));
+      _persistMirror();
+      _tablesCtrl.add(List.from(_localTables));
+    }, onError: _onCloudError);
 
-      _lastStateTimestamp = incomingTs;
-      _prefs.setInt('last_state_ts', _lastStateTimestamp);
+    _db!
+        .collection('inventory')
+        .snapshots(includeMetadataChanges: true)
+        .listen((snap) {
+      if (snap.docs.isEmpty && snap.metadata.isFromCache && _localInv.isNotEmpty) {
+        return;
+      }
+      _localInv =
+          _withPending(snap, 'inventory', (d, id) => InventoryItem.fromMap(d, id));
+      _persistMirror();
+      _invCtrl.add(List.from(_localInv));
+    }, onError: _onCloudError);
 
-      if (map['tables'] != null) {
-        _localTables = (map['tables'] as List)
-            .map((e) => GamingTable.fromMap(Map<String, dynamic>.from(e)))
-            .toList();
+    _db!
+        .collection('sales')
+        .snapshots(includeMetadataChanges: true)
+        .listen((snap) {
+      if (snap.docs.isEmpty &&
+          snap.metadata.isFromCache &&
+          _localSales.isNotEmpty) {
+        return;
       }
-      if (map['inv'] != null) {
-        _localInv = (map['inv'] as List)
-            .map((e) => InventoryItem.fromMap(Map<String, dynamic>.from(e)))
-            .toList();
-      }
-      if (map['sales'] != null) {
-        _localSales = (map['sales'] as List)
-            .map((e) => SaleRecord.fromMap(Map<String, dynamic>.from(e)))
-            .toList();
-      }
-      if (map['expenses'] != null) {
-        _localExpenses = (map['expenses'] as List)
-            .map((e) => ExpenseRecord.fromMap(Map<String, dynamic>.from(e)))
-            .toList();
-      }
-      if (map['closedDays'] != null) {
-        _localClosedDays = (map['closedDays'] as List)
-            .map((e) => ClosedDaySummary.fromMap(Map<String, dynamic>.from(e)))
-            .toList();
-      }
-      if (map['logs'] != null) {
-        _localLogs = (map['logs'] as List)
-            .map((e) => AuditLog.fromMap(Map<String, dynamic>.from(e)))
-            .toList();
-      }
+      _localSales =
+          _withPending(snap, 'sales', (d, id) => SaleRecord.fromMap(d, id));
+      _persistMirror();
+      _salesCtrl.add(_localSales.where((s) => !s.isClosed).toList());
+    }, onError: _onCloudError);
 
-      _saveAndEmitLocal(broadcastToPeers: false);
-
-      final alertTitle = map['alertTitle'] as String?;
-      final alertBody = map['alertBody'] as String?;
-      if (alertTitle != null && alertBody != null) {
-        NotificationService().showEgyptianAlert(
-          id: DateTime.now().millisecondsSinceEpoch ~/ 1000,
-          title: alertTitle,
-          body: alertBody,
-        );
+    _db!
+        .collection('expenses')
+        .snapshots(includeMetadataChanges: true)
+        .listen((snap) {
+      if (snap.docs.isEmpty &&
+          snap.metadata.isFromCache &&
+          _localExpenses.isNotEmpty) {
+        return;
       }
-    } catch (_) {}
-  }
-
-  void _listenToCloudRealtimeStreams() {
-    _db!.collection('tables').snapshots().listen((snapshot) {
-      final list = snapshot.docs.map(GamingTable.fromDoc).toList();
-      if (list.isNotEmpty) {
-        _localTables = list;
-        _tablesCtrl.add(list);
-      }
-    });
-
-    _db!.collection('inventory').snapshots().listen((snapshot) {
-      final list = snapshot.docs.map(InventoryItem.fromDoc).toList();
-      if (list.isNotEmpty) {
-        _localInv = list;
-        _invCtrl.add(list);
-      }
-    });
-
-    _db!.collection('sales').snapshots().listen((snapshot) {
-      final list = snapshot.docs
-          .map(SaleRecord.fromDoc)
-          .where((s) => !s.isClosed)
-          .toList();
-      _localSales = list;
-      _salesCtrl.add(list);
-    });
-
-    _db!.collection('expenses').snapshots().listen((snapshot) {
-      final list = snapshot.docs.map(ExpenseRecord.fromDoc).toList();
-      _localExpenses = list;
-      _expensesCtrl.add(list);
-    });
+      _localExpenses =
+          _withPending(snap, 'expenses', (d, id) => ExpenseRecord.fromMap(d, id));
+      _persistMirror();
+      _expensesCtrl.add(List.from(_localExpenses));
+    }, onError: _onCloudError);
 
     _db!
         .collection('closed_days')
         .orderBy('closedAt', descending: true)
-        .snapshots()
-        .listen((snapshot) {
-      final list = snapshot.docs.map(ClosedDaySummary.fromDoc).toList();
-      _localClosedDays = list;
-      _closedDaysCtrl.add(list);
-    });
+        .snapshots(includeMetadataChanges: true)
+        .listen((snap) {
+      if (snap.docs.isEmpty &&
+          snap.metadata.isFromCache &&
+          _localClosedDays.isNotEmpty) {
+        return;
+      }
+      _localClosedDays = _withPending(
+          snap, 'closed_days', (d, id) => ClosedDaySummary.fromMap(d, id));
+      _persistMirror();
+      _closedDaysCtrl.add(List.from(_localClosedDays));
+    }, onError: _onCloudError);
+
+    _db!
+        .collection('audit_logs')
+        .orderBy('timestamp', descending: true)
+        .limit(200)
+        .snapshots(includeMetadataChanges: true)
+        .listen((snap) {
+      if (snap.docs.isEmpty &&
+          snap.metadata.isFromCache &&
+          _localLogs.isNotEmpty) {
+        return;
+      }
+      _localLogs =
+          _withPending(snap, 'audit_logs', (d, id) => AuditLog.fromMap(d, id));
+      _persistMirror();
+      _logsCtrl.add(List.from(_localLogs));
+
+      if (_isInitialAuditLoad) {
+        if (snap.metadata.isFromCache) return;
+        _isInitialAuditLoad = false;
+        return;
+      }
+      for (final change in snap.docChanges) {
+        if (change.type != DocumentChangeType.added) continue;
+        if (change.doc.metadata.hasPendingWrites) continue;
+        final log = AuditLog.fromDoc(change.doc);
+        if (log.deviceId == deviceId) continue;
+        NotificationService().showEgyptianAlert(
+          id: DateTime.now().millisecondsSinceEpoch ~/ 1000,
+          title: log.title,
+          body: log.message,
+        );
+      }
+    }, onError: _onCloudError);
   }
 
-  void _loadAndSeedLocalData() {
+  void _onCloudError(Object e) {
+    _lastError = _friendlyError(e);
+    _emitStatus();
+  }
+
+  String _friendlyError(Object e) {
+    final s = e.toString();
+    if (s.contains('permission-denied')) {
+      return 'صلاحيات Firestore مرفوضة - راجع قواعد الأمان';
+    }
+    if (s.contains('unavailable')) return 'السحابة غير متاحة حالياً';
+    if (s.contains('network-request-failed')) return 'لا يوجد اتصال بالإنترنت';
+    if (s.contains('operation-not-allowed')) {
+      return 'التحقق المجهول غير مُفعّل - فعّله من Firebase Authentication';
+    }
+    if (s.contains('invalid-api-key') || s.contains('API key not valid')) {
+      return 'مفتاح Firebase غير صحيح - راجع firebase_options.dart';
+    }
+    if (s.contains('configuration-not-found')) {
+      return 'Firebase غير مُفعّل - راجع إعدادات المشروع';
+    }
+    return s.length > 180 ? '${s.substring(0, 180)}...' : s;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Durable outbox: every change is saved locally first, then pushed to cloud.
+  // ---------------------------------------------------------------------------
+
+  Future<void> _enqueue(String collection, String docId,
+      Map<String, dynamic>? data,
+      {bool merge = true}) async {
+    _rememberPending(collection, docId, data);
+    _outbox.add(_PendingOp(
+      collection: collection,
+      docId: docId,
+      data: data,
+      merge: merge,
+    ));
+    await _persistOutbox();
+    _emitStatus();
+  }
+
+  void _rememberPending(
+      String collection, String docId, Map<String, dynamic>? data) {
+    final docs = _pendingDocs.putIfAbsent(collection, () => {});
+    if (data == null) {
+      docs[docId] = null;
+      return;
+    }
+    // Snapshots that do not contain this document yet (offline create, or a
+    // document added after the last cache update) are rebuilt from the full
+    // local copy, otherwise a partial update such as {"stock": 5} would show
+    // an item with no name or price.
+    final full = _fullLocalDoc(collection, docId);
+    final merged = full == null
+        ? Map<String, dynamic>.from(data)
+        : <String, dynamic>{...full, ...data};
+    final previous = docs[docId];
+    docs[docId] =
+        previous == null ? merged : <String, dynamic>{...previous, ...merged};
+  }
+
+  Map<String, dynamic>? _fullLocalDoc(String collection, String docId) {
+    switch (collection) {
+      case 'tables':
+        for (final e in _localTables) {
+          if (e.id == docId) return e.toMap(forLocal: true);
+        }
+      case 'inventory':
+        for (final e in _localInv) {
+          if (e.id == docId) return e.toMap();
+        }
+      case 'sales':
+        for (final e in _localSales) {
+          if (e.id == docId) return e.toMap(forLocal: true);
+        }
+      case 'expenses':
+        for (final e in _localExpenses) {
+          if (e.id == docId) return e.toMap(forLocal: true);
+        }
+      case 'closed_days':
+        for (final e in _localClosedDays) {
+          if (e.id == docId) return e.toMap(forLocal: true);
+        }
+      case 'audit_logs':
+        for (final e in _localLogs) {
+          if (e.id == docId) return e.toMap(forLocal: true);
+        }
+    }
+    return null;
+  }
+
+  void _forgetPending(String collection, String docId) {
+    final docs = _pendingDocs[collection];
+    if (docs == null) return;
+    docs.remove(docId);
+    if (docs.isEmpty) _pendingDocs.remove(collection);
+  }
+
+  /// Merge the not-yet-uploaded local edits into a cloud snapshot. New local
+  /// documents are placed first (the app always shows newest first), deleted
+  /// ones are removed, and partial updates are merged over the cloud values.
+  List<T> _withPending<T>(
+    QuerySnapshot<Map<String, dynamic>> snap,
+    String collection,
+    T Function(Map<String, dynamic> data, String id) build,
+  ) {
+    final cloud = <String, Map<String, dynamic>>{};
+    final order = <String>[];
+    for (final doc in snap.docs) {
+      cloud[doc.id] = Map<String, dynamic>.from(doc.data());
+      order.add(doc.id);
+    }
+
+    final pending = _pendingDocs[collection];
+    if (pending == null || pending.isEmpty) {
+      return [for (final id in order) build(cloud[id]!, id)];
+    }
+
+    final added = <String>[];
+    pending.forEach((id, data) {
+      if (data == null) {
+        cloud.remove(id);
+        order.remove(id);
+      } else if (cloud.containsKey(id)) {
+        cloud[id] = {...cloud[id]!, ...data};
+      } else {
+        cloud[id] = Map<String, dynamic>.from(data);
+        added.add(id);
+      }
+    });
+
+    return [
+      for (final id in added.reversed) build(cloud[id]!, id),
+      for (final id in order)
+        if (cloud.containsKey(id)) build(cloud[id]!, id),
+    ];
+  }
+
+  void _kick() {
+    unawaited(_flushOutbox());
+  }
+
+  Future<void> _flushOutbox() async {
+    if (!useCloud || _db == null || _flushing || _outbox.isEmpty) return;
+    // While offline the queue stays on disk. `connectivity_plus` kicks it
+    // again the moment a connection returns.
+    if (!_online) return;
+    _flushing = true;
+    try {
+      while (_outbox.isNotEmpty) {
+        final op = _outbox.first;
+        try {
+          final doc = _db!.collection(op.collection).doc(op.docId);
+          if (op.data == null) {
+            await doc.delete().timeout(const Duration(seconds: 20));
+          } else if (op.merge) {
+            await doc
+                .set(_toFirestoreData(op.data!), SetOptions(merge: true))
+                .timeout(const Duration(seconds: 20));
+          } else {
+            await doc
+                .set(_toFirestoreData(op.data!))
+                .timeout(const Duration(seconds: 20));
+          }
+          _outbox.removeAt(0);
+          if (!_outbox.any((o) =>
+              o.collection == op.collection && o.docId == op.docId)) {
+            _forgetPending(op.collection, op.docId);
+          }
+          await _persistOutbox();
+          _emitStatus();
+        } catch (e) {
+          _lastError = _friendlyError(e);
+          if (_isPermanentError(e)) {
+            op.attempts++;
+            if (op.attempts >= 5) {
+              // Rejected repeatedly (e.g. by security rules). Move it aside
+              // so it cannot block the rest of the queue, but keep it on
+              // disk instead of throwing the user's data away.
+              _deadLetters.add(op.toJson());
+              _outbox.removeAt(0);
+              await _persistDeadLetters();
+              await _persistOutbox();
+              _emitStatus();
+              continue;
+            }
+          }
+          // Network / timeout / unavailable: keep the operation queued and
+          // end this pass. The 30s timer and the connectivity listener will
+          // retry it.
+          break;
+        }
+      }
+      if (_outbox.isEmpty && _lastError != null) {
+        _lastError = null;
+      }
+    } finally {
+      _flushing = false;
+      _emitStatus();
+    }
+  }
+
+  bool _isPermanentError(Object e) {
+    final s = e.toString();
+    return s.contains('permission-denied') ||
+        s.contains('invalid-argument') ||
+        s.contains('failed-precondition') ||
+        s.contains('out-of-range');
+  }
+
+  static const _timestampKeys = {
+    'timestamp',
+    'closedAt',
+    'lastStartTime',
+    'updatedAt',
+    'createdAt',
+  };
+
+  Map<String, dynamic> _toFirestoreData(Map<String, dynamic> data) {
+    final out = <String, dynamic>{};
+    data.forEach((k, v) => out[k] = _convertValue(k, v));
+    return out;
+  }
+
+  dynamic _convertValue(String key, dynamic v) {
+    if (v == null) return null;
+    if (_timestampKeys.contains(key)) {
+      if (v is Timestamp) return v;
+      if (v is DateTime) return Timestamp.fromDate(v);
+      if (v is String) {
+        final d = DateTime.tryParse(v);
+        if (d != null) return Timestamp.fromDate(d);
+      }
+    }
+    if (v is Map) return _toFirestoreData(Map<String, dynamic>.from(v));
+    if (v is List) {
+      return v
+          .map((e) =>
+              e is Map ? _toFirestoreData(Map<String, dynamic>.from(e)) : e)
+          .toList();
+    }
+    return v;
+  }
+
+  Future<void> _persistOutbox() async {
+    try {
+      await _prefs.setString(
+          'pending_writes', jsonEncode(_outbox.map((e) => e.toJson()).toList()));
+    } catch (_) {}
+  }
+
+  void _loadOutbox() {
+    try {
+      final raw = _prefs.getString('pending_writes');
+      if (raw == null) return;
+      final list = jsonDecode(raw) as List;
+      _outbox
+        ..clear()
+        ..addAll(list
+            .map((e) => _PendingOp.fromJson(Map<String, dynamic>.from(e))));
+      _pendingDocs.clear();
+      for (final op in _outbox) {
+        _rememberPending(op.collection, op.docId, op.data);
+      }
+    } catch (_) {
+      _outbox.clear();
+    }
+  }
+
+  Future<void> _persistDeadLetters() async {
+    try {
+      await _prefs.setString('dead_writes', jsonEncode(_deadLetters));
+    } catch (_) {}
+  }
+
+  void _loadDeadLetters() {
+    try {
+      final raw = _prefs.getString('dead_writes');
+      if (raw == null) return;
+      final list = jsonDecode(raw) as List;
+      _deadLetters
+        ..clear()
+        ..addAll(list.map((e) => Map<String, dynamic>.from(e)));
+    } catch (_) {}
+  }
+
+  // ---------------------------------------------------------------------------
+  // Local mirror (instant startup + durable fallback when cloud is unreachable)
+  // ---------------------------------------------------------------------------
+
+  void _loadLocalMirror() {
     final tRaw = _prefs.getString('local_tables');
     if (tRaw != null) {
-      final list = jsonDecode(tRaw) as List;
-      _localTables = list
-          .map((e) => GamingTable.fromMap(Map<String, dynamic>.from(e)))
-          .toList();
-    } else {
+      try {
+        final list = jsonDecode(tRaw) as List;
+        _localTables = list
+            .map((e) => GamingTable.fromMap(Map<String, dynamic>.from(e)))
+            .toList();
+      } catch (_) {}
+    }
+    if (_localTables.isEmpty) {
       _localTables = [
         GamingTable(
             id: 'billiard',
@@ -910,11 +1199,14 @@ class FirestoreService {
 
     final iRaw = _prefs.getString('local_inv');
     if (iRaw != null) {
-      final list = jsonDecode(iRaw) as List;
-      _localInv = list
-          .map((e) => InventoryItem.fromMap(Map<String, dynamic>.from(e)))
-          .toList();
-    } else {
+      try {
+        final list = jsonDecode(iRaw) as List;
+        _localInv = list
+            .map((e) => InventoryItem.fromMap(Map<String, dynamic>.from(e)))
+            .toList();
+      } catch (_) {}
+    }
+    if (_localInv.isEmpty) {
       _localInv = [
         InventoryItem(
             id: '1',
@@ -951,135 +1243,112 @@ class FirestoreService {
 
     final sRaw = _prefs.getString('local_sales');
     if (sRaw != null) {
-      final list = jsonDecode(sRaw) as List;
-      _localSales = list
-          .map((e) => SaleRecord.fromMap(Map<String, dynamic>.from(e)))
-          .toList();
+      try {
+        final list = jsonDecode(sRaw) as List;
+        _localSales = list
+            .map((e) => SaleRecord.fromMap(Map<String, dynamic>.from(e)))
+            .toList();
+      } catch (_) {}
     }
 
     final eRaw = _prefs.getString('local_expenses');
     if (eRaw != null) {
-      final list = jsonDecode(eRaw) as List;
-      _localExpenses = list
-          .map((e) => ExpenseRecord.fromMap(Map<String, dynamic>.from(e)))
-          .toList();
+      try {
+        final list = jsonDecode(eRaw) as List;
+        _localExpenses = list
+            .map((e) => ExpenseRecord.fromMap(Map<String, dynamic>.from(e)))
+            .toList();
+      } catch (_) {}
     }
 
     final cRaw = _prefs.getString('local_closed_days');
     if (cRaw != null) {
-      final list = jsonDecode(cRaw) as List;
-      _localClosedDays = list
-          .map((e) => ClosedDaySummary.fromMap(Map<String, dynamic>.from(e)))
-          .toList();
+      try {
+        final list = jsonDecode(cRaw) as List;
+        _localClosedDays = list
+            .map((e) => ClosedDaySummary.fromMap(Map<String, dynamic>.from(e)))
+            .toList();
+      } catch (_) {}
     }
 
     final lRaw = _prefs.getString('local_logs');
     if (lRaw != null) {
-      final list = jsonDecode(lRaw) as List;
-      _localLogs = list
-          .map((e) => AuditLog.fromMap(Map<String, dynamic>.from(e)))
-          .toList();
+      try {
+        final list = jsonDecode(lRaw) as List;
+        _localLogs = list
+            .map((e) => AuditLog.fromMap(Map<String, dynamic>.from(e)))
+            .toList();
+      } catch (_) {}
     }
 
-    _saveAndEmitLocal(broadcastToPeers: false);
+    _emitAll();
   }
 
-  void _saveAndEmitLocal({bool broadcastToPeers = true, AuditLog? latestLog}) {
-    if (broadcastToPeers) {
-      _lastStateTimestamp = DateTime.now().millisecondsSinceEpoch;
-      _prefs.setInt('last_state_ts', _lastStateTimestamp);
-    }
+  Future<void> _persistMirror() async {
+    try {
+      await _prefs.setString('local_tables',
+          jsonEncode(_localTables.map((e) => e.toMap(forLocal: true)).toList()));
+      await _prefs.setString(
+          'local_inv', jsonEncode(_localInv.map((e) => e.toMap()).toList()));
+      await _prefs.setString('local_sales',
+          jsonEncode(_localSales.map((e) => e.toMap(forLocal: true)).toList()));
+      await _prefs.setString(
+          'local_expenses',
+          jsonEncode(
+              _localExpenses.map((e) => e.toMap(forLocal: true)).toList()));
+      await _prefs.setString(
+          'local_closed_days',
+          jsonEncode(
+              _localClosedDays.map((e) => e.toMap(forLocal: true)).toList()));
+      await _prefs.setString('local_logs',
+          jsonEncode(_localLogs.map((e) => e.toMap(forLocal: true)).toList()));
+    } catch (_) {}
+  }
 
-    _prefs.setString('local_tables',
-        jsonEncode(_localTables.map((e) => e.toMap(forLocal: true)).toList()));
-    _prefs.setString(
-        'local_inv', jsonEncode(_localInv.map((e) => e.toMap()).toList()));
-    _prefs.setString('local_sales',
-        jsonEncode(_localSales.map((e) => e.toMap(forLocal: true)).toList()));
-    _prefs.setString('local_expenses',
-        jsonEncode(_localExpenses.map((e) => e.toMap(forLocal: true)).toList()));
-    _prefs.setString(
-        'local_closed_days',
-        jsonEncode(
-            _localClosedDays.map((e) => e.toMap(forLocal: true)).toList()));
-    _prefs.setString('local_logs',
-        jsonEncode(_localLogs.map((e) => e.toMap(forLocal: true)).toList()));
+  void _saveLocal() {
+    unawaited(_persistMirror());
+    _emitAll();
+  }
 
+  void _emitAll() {
     _tablesCtrl.add(List.from(_localTables));
     _invCtrl.add(List.from(_localInv));
     _salesCtrl.add(_localSales.where((s) => !s.isClosed).toList());
     _expensesCtrl.add(List.from(_localExpenses));
     _closedDaysCtrl.add(List.from(_localClosedDays));
     _logsCtrl.add(List.from(_localLogs));
+  }
 
-    if (broadcastToPeers) {
-      _broadcastLanSync(latestLog: latestLog);
+  void _emitStatus() {
+    if (!_statusCtrl.isClosed) _statusCtrl.add(currentSyncStatus);
+  }
+
+  void forceSyncNow() {
+    // Put previously rejected writes back in the queue so a manual retry can
+    // recover them after the security rules / config have been fixed.
+    if (_deadLetters.isNotEmpty) {
+      for (final raw in _deadLetters) {
+        try {
+          final op = _PendingOp.fromJson(Map<String, dynamic>.from(raw));
+          op.attempts = 0;
+          _outbox.add(op);
+          _rememberPending(op.collection, op.docId, op.data);
+        } catch (_) {}
+      }
+      _deadLetters.clear();
+      unawaited(_persistDeadLetters());
+      unawaited(_persistOutbox());
     }
-  }
 
-  Future<void> _seedCloudDataIfNeeded() async {
-    try {
-      final tablesSnap = await _db!.collection('tables').get();
-      if (tablesSnap.docs.isEmpty) {
-        for (final t in _localTables) {
-          await _db!.collection('tables').doc(t.id).set(t.toMap());
-        }
-      }
-      final invSnap = await _db!.collection('inventory').get();
-      if (invSnap.docs.isEmpty) {
-        for (final item in _localInv) {
-          await _db!.collection('inventory').doc(item.id).set(item.toMap());
-        }
-      }
-    } catch (_) {}
-  }
-
-  void _listenToAuditLogsForNotifications() {
-    _db!
-        .collection('audit_logs')
-        .orderBy('timestamp', descending: true)
-        .limit(20)
-        .snapshots(includeMetadataChanges: true)
-        .listen((snapshot) {
-      if (_isInitialAuditLoad) {
-        _isInitialAuditLoad = false;
-        return;
-      }
-      for (final change in snapshot.docChanges) {
-        if (change.type == DocumentChangeType.added) {
-          if (change.doc.metadata.hasPendingWrites) continue;
-          final log = AuditLog.fromDoc(change.doc);
-          if (log.deviceId == deviceId) continue;
-          NotificationService().showEgyptianAlert(
-              id: DateTime.now().millisecondsSinceEpoch ~/ 1000,
-              title: log.title,
-              body: log.message);
-        }
-      }
-    });
-  }
-
-  Future<void> _recordAudit(
-      {required String title,
-      required String message,
-      required String beforeVal,
-      required String afterVal}) async {
-    final log = AuditLog(
-        id: const Uuid().v4(),
-        title: title,
-        message: message,
-        beforeVal: beforeVal,
-        afterVal: afterVal,
-        deviceId: deviceId,
-        timestamp: DateTime.now());
-    _localLogs.insert(0, log);
-    _saveAndEmitLocal(latestLog: log);
-
-    if (useCloud) {
-      try {
-        await _db!.collection('audit_logs').add(log.toMap());
-      } catch (_) {}
+    if (!useCloud) {
+      unawaited(_initCloud().then((_) {
+        _emitStatus();
+        _kick();
+      }));
+      return;
     }
+    unawaited(_seedCloudIfEmpty());
+    _kick();
   }
 
   List<GamingTable> get currentTables => List.from(_localTables);
@@ -1097,34 +1366,63 @@ class FirestoreService {
   Stream<List<ClosedDaySummary>> streamClosedDays() => _closedDaysCtrl.stream;
   Stream<List<AuditLog>> streamAuditLogs() => _logsCtrl.stream;
 
+  Future<void> _recordAudit(
+      {required String title,
+      required String message,
+      required String beforeVal,
+      required String afterVal}) async {
+    final log = AuditLog(
+        id: const Uuid().v4(),
+        title: title,
+        message: message,
+        beforeVal: beforeVal,
+        afterVal: afterVal,
+        deviceId: deviceId,
+        timestamp: DateTime.now());
+    _localLogs.insert(0, log);
+    _saveLocal();
+
+    await _enqueue('audit_logs', log.id, log.toMap(forLocal: true),
+        merge: false);
+    _kick();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Mutations
+  // ---------------------------------------------------------------------------
+
   // ريست / تصفير فواتير الشيفت الحالي فقط مع إرجاع الأصناف للمخزن
   Future<void> resetCurrentShiftInvoices() async {
-    for (final sale in _localSales.where((s) => !s.isClosed)) {
+    final activeSales = _localSales.where((s) => !s.isClosed).toList();
+    final restoredStock = <String, int>{};
+
+    for (final sale in activeSales) {
       for (final item in sale.soldItems) {
         final iIdx = _localInv.indexWhere((i) => i.id == item.itemId);
         if (iIdx >= 0) {
+          final newStock = _localInv[iIdx].stock + item.qty;
           _localInv[iIdx] = InventoryItem(
             id: _localInv[iIdx].id,
             name: _localInv[iIdx].name,
             price: _localInv[iIdx].price,
-            stock: _localInv[iIdx].stock + item.qty,
+            stock: newStock,
             lowStockThreshold: _localInv[iIdx].lowStockThreshold,
           );
+          restoredStock[_localInv[iIdx].id] = newStock;
         }
       }
     }
 
     _localSales.removeWhere((s) => !s.isClosed);
-    _saveAndEmitLocal();
+    _saveLocal();
 
-    if (useCloud) {
-      try {
-        final snap = await _db!.collection('sales').get();
-        for (final doc in snap.docs) {
-          await doc.reference.delete();
-        }
-      } catch (_) {}
+    for (final entry in restoredStock.entries) {
+      await _enqueue('inventory', entry.key, {'stock': entry.value});
     }
+    for (final sale in activeSales) {
+      await _enqueue('sales', sale.id, null);
+    }
+    _kick();
 
     await _recordAudit(
       title: 'ريست فواتير الشيفت',
@@ -1136,17 +1434,14 @@ class FirestoreService {
 
   // ريست / تصفير الشهر بالكامل (تصفير سجل الأيام المتقفلة)
   Future<void> resetMonthHistory() async {
+    final ids = _localClosedDays.map((e) => e.id).toList();
     _localClosedDays.clear();
-    _saveAndEmitLocal();
+    _saveLocal();
 
-    if (useCloud) {
-      try {
-        final snap = await _db!.collection('closed_days').get();
-        for (final doc in snap.docs) {
-          await doc.reference.delete();
-        }
-      } catch (_) {}
+    for (final id in ids) {
+      await _enqueue('closed_days', id, null);
     }
+    _kick();
 
     await _recordAudit(
       title: 'ريست حسابات الشهر',
@@ -1165,13 +1460,12 @@ class FirestoreService {
       timestamp: DateTime.now(),
     );
     _localExpenses.insert(0, expense);
-    _saveAndEmitLocal();
+    _saveLocal();
 
-    if (useCloud) {
-      try {
-        await _db!.collection('expenses').doc(expense.id).set(expense.toMap());
-      } catch (_) {}
-    }
+    await _enqueue('expenses', expense.id, expense.toMap(forLocal: true),
+        merge: false);
+    _kick();
+
     await _recordAudit(
       title: 'مصروف يومي جديد',
       message: 'تم إضافة مصروف [$title] بقيمة ${amount.toStringAsFixed(1)} ج.م',
@@ -1182,13 +1476,11 @@ class FirestoreService {
 
   Future<void> deleteDailyExpense(ExpenseRecord expense) async {
     _localExpenses.removeWhere((e) => e.id == expense.id);
-    _saveAndEmitLocal();
+    _saveLocal();
 
-    if (useCloud) {
-      try {
-        await _db!.collection('expenses').doc(expense.id).delete();
-      } catch (_) {}
-    }
+    await _enqueue('expenses', expense.id, null);
+    _kick();
+
     await _recordAudit(
       title: 'حذف مصروف يومي',
       message:
@@ -1212,13 +1504,11 @@ class FirestoreService {
         accumulatedSeconds: 0,
         attachedItems: []);
     _localTables.add(table);
-    _saveAndEmitLocal();
+    _saveLocal();
 
-    if (useCloud) {
-      try {
-        await _db!.collection('tables').doc(newId).set(table.toMap());
-      } catch (_) {}
-    }
+    await _enqueue('tables', newId, table.toMap(forLocal: true), merge: false);
+    _kick();
+
     await _recordAudit(
         title: 'إضافة ترابيزة',
         message: 'تم إضافة ترابيزة [$name]',
@@ -1228,13 +1518,11 @@ class FirestoreService {
 
   Future<void> deleteTable(GamingTable table) async {
     _localTables.removeWhere((t) => t.id == table.id);
-    _saveAndEmitLocal();
+    _saveLocal();
 
-    if (useCloud) {
-      try {
-        await _db!.collection('tables').doc(table.id).delete();
-      } catch (_) {}
-    }
+    await _enqueue('tables', table.id, null);
+    _kick();
+
     await _recordAudit(
         title: 'حذف ترابيزة',
         message: 'تم حذف ترابيزة [${table.name}]',
@@ -1256,14 +1544,11 @@ class FirestoreService {
           accumulatedSeconds: table.accumulatedSeconds,
           attachedItems: table.attachedItems,
           guestNotes: table.guestNotes);
-      _saveAndEmitLocal();
+      _saveLocal();
     }
-    if (useCloud) {
-      try {
-        await _db!.collection('tables').doc(table.id).update(
-            {'name': newName, 'type': newType, 'hourlyRate': newRate});
-      } catch (_) {}
-    }
+    await _enqueue('tables', table.id,
+        {'name': newName, 'type': newType, 'hourlyRate': newRate});
+    _kick();
   }
 
   Future<void> startTableTimer(GamingTable table) async {
@@ -1281,14 +1566,14 @@ class FirestoreService {
           accumulatedSeconds: table.accumulatedSeconds,
           attachedItems: table.attachedItems,
           guestNotes: table.guestNotes);
-      _saveAndEmitLocal();
+      _saveLocal();
     }
-    if (useCloud) {
-      try {
-        await _db!.collection('tables').doc(table.id).update(
-            {'status': 'running', 'lastStartTime': Timestamp.fromDate(now)});
-      } catch (_) {}
-    }
+    await _enqueue('tables', table.id, {
+      'status': 'running',
+      'lastStartTime': now.toIso8601String(),
+    });
+    _kick();
+
     await _recordAudit(
         title: 'تشغيل وقت: ${table.name}',
         message: 'تم بدء الوقت على ${table.name}',
@@ -1311,17 +1596,14 @@ class FirestoreService {
           accumulatedSeconds: totalElapsed,
           attachedItems: table.attachedItems,
           guestNotes: table.guestNotes);
-      _saveAndEmitLocal();
+      _saveLocal();
     }
-    if (useCloud) {
-      try {
-        await _db!.collection('tables').doc(table.id).update({
-          'status': 'paused',
-          'lastStartTime': null,
-          'accumulatedSeconds': totalElapsed
-        });
-      } catch (_) {}
-    }
+    await _enqueue('tables', table.id, {
+      'status': 'paused',
+      'lastStartTime': null,
+      'accumulatedSeconds': totalElapsed,
+    });
+    _kick();
   }
 
   Future<void> updateTableGuestNotes(String tableId, String notes) async {
@@ -1338,42 +1620,43 @@ class FirestoreService {
           accumulatedSeconds: table.accumulatedSeconds,
           attachedItems: table.attachedItems,
           guestNotes: notes);
-      _saveAndEmitLocal();
+      _saveLocal();
     }
-    if (useCloud) {
-      try {
-        await _db!
-            .collection('tables')
-            .doc(tableId)
-            .update({'guestNotes': notes});
-      } catch (_) {}
-    }
+    await _enqueue('tables', tableId, {'guestNotes': notes});
+    _kick();
   }
 
   Future<void> updateTableAttachedItems(
       GamingTable table, List<AttachedItem> newItems) async {
+    final stockUpdates = <String, int>{};
+
     for (final oldItem in table.attachedItems) {
       final iIdx = _localInv.indexWhere((i) => i.id == oldItem.itemId);
       if (iIdx >= 0) {
+        final newStock = _localInv[iIdx].stock + oldItem.qty;
         _localInv[iIdx] = InventoryItem(
           id: _localInv[iIdx].id,
           name: _localInv[iIdx].name,
           price: _localInv[iIdx].price,
-          stock: _localInv[iIdx].stock + oldItem.qty,
+          stock: newStock,
           lowStockThreshold: _localInv[iIdx].lowStockThreshold,
         );
+        stockUpdates[_localInv[iIdx].id] = newStock;
       }
     }
     for (final newItem in newItems) {
       final iIdx = _localInv.indexWhere((i) => i.id == newItem.itemId);
       if (iIdx >= 0) {
+        final newStock =
+            (_localInv[iIdx].stock - newItem.qty).clamp(0, 999999);
         _localInv[iIdx] = InventoryItem(
           id: _localInv[iIdx].id,
           name: _localInv[iIdx].name,
           price: _localInv[iIdx].price,
-          stock: (_localInv[iIdx].stock - newItem.qty).clamp(0, 999999),
+          stock: newStock,
           lowStockThreshold: _localInv[iIdx].lowStockThreshold,
         );
+        stockUpdates[_localInv[iIdx].id] = newStock;
       }
     }
 
@@ -1389,19 +1672,22 @@ class FirestoreService {
           accumulatedSeconds: table.accumulatedSeconds,
           attachedItems: newItems,
           guestNotes: table.guestNotes);
-      _saveAndEmitLocal();
+      _saveLocal();
     }
-    if (useCloud) {
-      try {
-        await _db!.collection('tables').doc(table.id).update(
-            {'attachedItems': newItems.map((e) => e.toMap()).toList()});
-      } catch (_) {}
+
+    for (final entry in stockUpdates.entries) {
+      await _enqueue('inventory', entry.key, {'stock': entry.value});
     }
+    await _enqueue(
+        'tables', table.id, {'attachedItems': newItems.map((e) => e.toMap()).toList()});
+    _kick();
   }
 
   Future<void> attachDrinksToTable(
       GamingTable table, Map<InventoryItem, int> selectedDrinks) async {
     final updatedList = List<AttachedItem>.from(table.attachedItems);
+    final stockUpdates = <String, int>{};
+
     for (final entry in selectedDrinks.entries) {
       final item = entry.key;
       final qty = entry.value;
@@ -1415,14 +1701,7 @@ class FirestoreService {
             price: item.price,
             stock: newStock,
             lowStockThreshold: item.lowStockThreshold);
-      }
-      if (useCloud) {
-        try {
-          await _db!
-              .collection('inventory')
-              .doc(item.id)
-              .update({'stock': newStock});
-        } catch (_) {}
+        stockUpdates[item.id] = newStock;
       }
 
       final existingIndex =
@@ -1453,14 +1732,14 @@ class FirestoreService {
           attachedItems: updatedList,
           guestNotes: table.guestNotes);
     }
-    _saveAndEmitLocal();
+    _saveLocal();
 
-    if (useCloud) {
-      try {
-        await _db!.collection('tables').doc(table.id).update(
-            {'attachedItems': updatedList.map((e) => e.toMap()).toList()});
-      } catch (_) {}
+    for (final entry in stockUpdates.entries) {
+      await _enqueue('inventory', entry.key, {'stock': entry.value});
     }
+    await _enqueue('tables', table.id,
+        {'attachedItems': updatedList.map((e) => e.toMap()).toList()});
+    _kick();
   }
 
   Future<SaleRecord> endAndCheckoutTable(GamingTable table) async {
@@ -1496,20 +1775,18 @@ class FirestoreService {
           attachedItems: [],
           guestNotes: '');
     }
-    _saveAndEmitLocal();
+    _saveLocal();
 
-    if (useCloud) {
-      try {
-        await _db!.collection('sales').doc(sale.id).set(sale.toMap());
-        await _db!.collection('tables').doc(table.id).update({
-          'status': 'idle',
-          'lastStartTime': null,
-          'accumulatedSeconds': 0,
-          'attachedItems': [],
-          'guestNotes': ''
-        });
-      } catch (_) {}
-    }
+    await _enqueue('sales', sale.id, sale.toMap(forLocal: true), merge: false);
+    await _enqueue('tables', table.id, {
+      'status': 'idle',
+      'lastStartTime': null,
+      'accumulatedSeconds': 0,
+      'attachedItems': <Map<String, dynamic>>[],
+      'guestNotes': '',
+    });
+    _kick();
+
     await _recordAudit(
         title: 'حساب ترابيزة',
         message: 'حساب ${table.name} بمبلغ ${total.toStringAsFixed(1)} ج.م',
@@ -1521,6 +1798,8 @@ class FirestoreService {
   Future<void> checkoutDirectPos(Map<InventoryItem, int> cart) async {
     double totalDrinks = 0;
     final List<AttachedItem> soldItems = [];
+    final stockUpdates = <String, int>{};
+
     for (final entry in cart.entries) {
       final item = entry.key;
       final qty = entry.value;
@@ -1537,14 +1816,7 @@ class FirestoreService {
             price: item.price,
             stock: newStock,
             lowStockThreshold: item.lowStockThreshold);
-      }
-      if (useCloud) {
-        try {
-          await _db!
-              .collection('inventory')
-              .doc(item.id)
-              .update({'stock': newStock});
-        } catch (_) {}
+        stockUpdates[item.id] = newStock;
       }
     }
 
@@ -1560,13 +1832,14 @@ class FirestoreService {
         timestamp: DateTime.now(),
         isClosed: false);
     _localSales.insert(0, sale);
-    _saveAndEmitLocal();
+    _saveLocal();
 
-    if (useCloud) {
-      try {
-        await _db!.collection('sales').doc(sale.id).set(sale.toMap());
-      } catch (_) {}
+    for (final entry in stockUpdates.entries) {
+      await _enqueue('inventory', entry.key, {'stock': entry.value});
     }
+    await _enqueue('sales', sale.id, sale.toMap(forLocal: true), merge: false);
+    _kick();
+
     await _recordAudit(
         title: 'فاتورة بيع مباشر',
         message:
@@ -1578,40 +1851,47 @@ class FirestoreService {
   Future<void> updateSaleRecord(
       SaleRecord oldSale, List<AttachedItem> updatedItems) async {
     final oldTotal = oldSale.totalRevenue;
+    final stockUpdates = <String, int>{};
 
     for (final oldItem in oldSale.soldItems) {
       final iIdx = _localInv.indexWhere((i) => i.id == oldItem.itemId);
       if (iIdx >= 0) {
+        final newStock = _localInv[iIdx].stock + oldItem.qty;
         _localInv[iIdx] = InventoryItem(
           id: _localInv[iIdx].id,
           name: _localInv[iIdx].name,
           price: _localInv[iIdx].price,
-          stock: _localInv[iIdx].stock + oldItem.qty,
+          stock: newStock,
           lowStockThreshold: _localInv[iIdx].lowStockThreshold,
         );
+        stockUpdates[_localInv[iIdx].id] = newStock;
       }
     }
 
     for (final newItem in updatedItems) {
       final iIdx = _localInv.indexWhere((i) => i.id == newItem.itemId);
       if (iIdx >= 0) {
+        final newStock =
+            (_localInv[iIdx].stock - newItem.qty).clamp(0, 999999);
         _localInv[iIdx] = InventoryItem(
           id: _localInv[iIdx].id,
           name: _localInv[iIdx].name,
           price: _localInv[iIdx].price,
-          stock: (_localInv[iIdx].stock - newItem.qty).clamp(0, 999999),
+          stock: newStock,
           lowStockThreshold: _localInv[iIdx].lowStockThreshold,
         );
+        stockUpdates[_localInv[iIdx].id] = newStock;
       }
     }
 
     final newDrinksRev =
         updatedItems.fold<double>(0.0, (sum, item) => sum + item.total);
     final newTotalRev = oldSale.timeRevenue + newDrinksRev;
+    final shouldDelete = updatedItems.isEmpty && oldSale.timeRevenue <= 0;
 
     final sIdx = _localSales.indexWhere((s) => s.id == oldSale.id);
     if (sIdx >= 0) {
-      if (updatedItems.isEmpty && oldSale.timeRevenue <= 0) {
+      if (shouldDelete) {
         _localSales.removeAt(sIdx);
       } else {
         _localSales[sIdx] = SaleRecord(
@@ -1629,21 +1909,21 @@ class FirestoreService {
       }
     }
 
-    _saveAndEmitLocal();
+    _saveLocal();
 
-    if (useCloud) {
-      try {
-        if (updatedItems.isEmpty && oldSale.timeRevenue <= 0) {
-          await _db!.collection('sales').doc(oldSale.id).delete();
-        } else {
-          await _db!.collection('sales').doc(oldSale.id).update({
-            'drinksRevenue': newDrinksRev,
-            'totalRevenue': newTotalRev,
-            'soldItems': updatedItems.map((e) => e.toMap()).toList(),
-          });
-        }
-      } catch (_) {}
+    for (final entry in stockUpdates.entries) {
+      await _enqueue('inventory', entry.key, {'stock': entry.value});
     }
+    if (shouldDelete) {
+      await _enqueue('sales', oldSale.id, null);
+    } else {
+      await _enqueue('sales', oldSale.id, {
+        'drinksRevenue': newDrinksRev,
+        'totalRevenue': newTotalRev,
+        'soldItems': updatedItems.map((e) => e.toMap()).toList(),
+      });
+    }
+    _kick();
 
     await _recordAudit(
       title: 'تعديل فاتورة (${oldSale.label})',
@@ -1655,27 +1935,31 @@ class FirestoreService {
   }
 
   Future<void> deleteSaleRecord(SaleRecord sale) async {
+    final stockUpdates = <String, int>{};
+
     for (final item in sale.soldItems) {
       final iIdx = _localInv.indexWhere((i) => i.id == item.itemId);
       if (iIdx >= 0) {
+        final newStock = _localInv[iIdx].stock + item.qty;
         _localInv[iIdx] = InventoryItem(
           id: _localInv[iIdx].id,
           name: _localInv[iIdx].name,
           price: _localInv[iIdx].price,
-          stock: _localInv[iIdx].stock + item.qty,
+          stock: newStock,
           lowStockThreshold: _localInv[iIdx].lowStockThreshold,
         );
+        stockUpdates[_localInv[iIdx].id] = newStock;
       }
     }
 
     _localSales.removeWhere((s) => s.id == sale.id);
-    _saveAndEmitLocal();
+    _saveLocal();
 
-    if (useCloud) {
-      try {
-        await _db!.collection('sales').doc(sale.id).delete();
-      } catch (_) {}
+    for (final entry in stockUpdates.entries) {
+      await _enqueue('inventory', entry.key, {'stock': entry.value});
     }
+    await _enqueue('sales', sale.id, null);
+    _kick();
 
     await _recordAudit(
       title: 'حذف فاتورة (${sale.label})',
@@ -1698,12 +1982,14 @@ class FirestoreService {
 
     double extraTableRev = 0;
     double extraDrinks = 0;
+    final resetTables = <String>[];
 
     for (int i = 0; i < _localTables.length; i++) {
       final t = _localTables[i];
       if (t.currentElapsedSeconds > 0 || t.attachedItems.isNotEmpty) {
         extraTableRev += t.currentTimeCost;
         extraDrinks += t.attachedDrinksCost;
+        resetTables.add(t.id);
         _localTables[i] = GamingTable(
             id: t.id,
             name: t.name,
@@ -1731,38 +2017,37 @@ class FirestoreService {
       closedAt: now,
     );
 
+    final saleIds = _localSales.map((s) => s.id).toList();
+    final expenseIds = _localExpenses.map((e) => e.id).toList();
+
     if (finalDrinks + finalTables > 0 || expensesTotal > 0) {
       _localClosedDays.insert(0, summary);
     }
     _localSales.clear();
     _localExpenses.clear();
-    _saveAndEmitLocal();
+    _saveLocal();
 
-    if (useCloud) {
-      try {
-        if (finalDrinks + finalTables > 0 || expensesTotal > 0) {
-          await _db!.collection('closed_days').add(summary.toMap());
-        }
-        final tablesSnap = await _db!.collection('tables').get();
-        for (final doc in tablesSnap.docs) {
-          await doc.reference.update({
-            'status': 'idle',
-            'lastStartTime': null,
-            'accumulatedSeconds': 0,
-            'attachedItems': [],
-            'guestNotes': ''
-          });
-        }
-        final allSalesSnap = await _db!.collection('sales').get();
-        for (final doc in allSalesSnap.docs) {
-          await doc.reference.delete();
-        }
-        final allExpSnap = await _db!.collection('expenses').get();
-        for (final doc in allExpSnap.docs) {
-          await doc.reference.delete();
-        }
-      } catch (_) {}
+    if (finalDrinks + finalTables > 0 || expensesTotal > 0) {
+      await _enqueue(
+          'closed_days', summary.id, summary.toMap(forLocal: true),
+          merge: false);
     }
+    for (final tableId in resetTables) {
+      await _enqueue('tables', tableId, {
+        'status': 'idle',
+        'lastStartTime': null,
+        'accumulatedSeconds': 0,
+        'attachedItems': <Map<String, dynamic>>[],
+        'guestNotes': '',
+      });
+    }
+    for (final id in saleIds) {
+      await _enqueue('sales', id, null);
+    }
+    for (final id in expenseIds) {
+      await _enqueue('expenses', id, null);
+    }
+    _kick();
 
     await _recordAudit(
         title: 'تقفيل اليوم - Joker Cafe',
@@ -1784,13 +2069,10 @@ class FirestoreService {
         stock: stock,
         lowStockThreshold: threshold);
     _localInv.add(newItem);
-    _saveAndEmitLocal();
+    _saveLocal();
 
-    if (useCloud) {
-      try {
-        await _db!.collection('inventory').doc(newItem.id).set(newItem.toMap());
-      } catch (_) {}
-    }
+    await _enqueue('inventory', newItem.id, newItem.toMap(), merge: false);
+    _kick();
   }
 
   Future<void> updateItemPrice(InventoryItem item, double newPrice) async {
@@ -1802,16 +2084,10 @@ class FirestoreService {
           price: newPrice,
           stock: item.stock,
           lowStockThreshold: item.lowStockThreshold);
-      _saveAndEmitLocal();
+      _saveLocal();
     }
-    if (useCloud) {
-      try {
-        await _db!
-            .collection('inventory')
-            .doc(item.id)
-            .update({'price': newPrice});
-      } catch (_) {}
-    }
+    await _enqueue('inventory', item.id, {'price': newPrice});
+    _kick();
   }
 
   Future<void> updateItemStock(InventoryItem item, int newStock) async {
@@ -1823,28 +2099,20 @@ class FirestoreService {
           price: item.price,
           stock: newStock,
           lowStockThreshold: item.lowStockThreshold);
-      _saveAndEmitLocal();
+      _saveLocal();
     }
-    if (useCloud) {
-      try {
-        await _db!
-            .collection('inventory')
-            .doc(item.id)
-            .update({'stock': newStock});
-      } catch (_) {}
-    }
+    await _enqueue('inventory', item.id, {'stock': newStock});
+    _kick();
   }
 
   Future<void> deleteInventoryItem(InventoryItem item) async {
     _localInv.removeWhere((i) => i.id == item.id);
-    _saveAndEmitLocal();
-    if (useCloud) {
-      try {
-        await _db!.collection('inventory').doc(item.id).delete();
-      } catch (_) {}
-    }
+    _saveLocal();
+    await _enqueue('inventory', item.id, null);
+    _kick();
   }
 }
+
 
 // =============================================================================
 // 4. MAIN ENTRY POINT & UI
@@ -1854,7 +2122,9 @@ void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   bool firebaseReady = false;
   try {
-    await Firebase.initializeApp();
+    await Firebase.initializeApp(
+      options: DefaultFirebaseOptions.currentPlatform,
+    );
     firebaseReady = true;
   } catch (_) {
     firebaseReady = false;
@@ -1916,43 +2186,69 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
   int _selectedIndex = 0;
   final Map<String, int> _posCart = {};
 
-  void _showManualSyncDialog() async {
-    final localIps = await widget.db.getLocalIpAddresses();
-    final ipCtrl = TextEditingController();
-
-    if (!mounted) return;
+  void _showManualSyncDialog() {
     showDialog(
       context: context,
       builder: (dialogCtx) => AlertDialog(
-        title: const Text('حالة الربط والمزامنة بين اللاب والموبايل'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              'الأجهزة المتصلة حالياً: ${widget.db.connectedPeersCount}',
-              style: const TextStyle(
-                  fontWeight: FontWeight.bold, color: Color(0xFF00C896)),
-            ),
-            const SizedBox(height: 8),
-            Text(
-              'عنوان IP هذا الجهاز: ${localIps.isEmpty ? "غير متصل بالواي فاي" : localIps.join(" / ")}',
-              style: const TextStyle(fontSize: 13, color: Colors.white70),
-            ),
-            const Divider(height: 20),
-            const Text(
-              'لو الجهازين مش شايفين بعض تلقائي على الواي فاي، اكتب IP الجهاز التاني هنا:',
-              style: TextStyle(fontSize: 12),
-            ),
-            const SizedBox(height: 8),
-            TextField(
-              controller: ipCtrl,
-              decoration: const InputDecoration(
-                hintText: 'مثال: 192.168.1.5',
-                border: OutlineInputBorder(),
-              ),
-            ),
-          ],
+        title: const Text('المزامنة السحابية - Joker Cafe'),
+        content: StreamBuilder<SyncStatus>(
+          initialData: widget.db.currentSyncStatus,
+          stream: widget.db.streamSyncStatus(),
+          builder: (context, statusSnap) {
+            final status = statusSnap.data ?? widget.db.currentSyncStatus;
+            return Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _cloudRow(
+                  icon: status.cloudReady ? Icons.cloud_done : Icons.cloud_off,
+                  color: status.cloudReady
+                      ? const Color(0xFF00C896)
+                      : Colors.orangeAccent,
+                  label: 'قاعدة البيانات السحابية',
+                  value: status.cloudReady ? 'متصل بـ Firebase' : 'غير متصل',
+                ),
+                const SizedBox(height: 8),
+                _cloudRow(
+                  icon: status.online ? Icons.wifi : Icons.wifi_off,
+                  color: status.online
+                      ? const Color(0xFF00C896)
+                      : Colors.orangeAccent,
+                  label: 'الإنترنت',
+                  value: status.online ? 'متاح' : 'غير متاح',
+                ),
+                const SizedBox(height: 8),
+                _cloudRow(
+                  icon: status.pendingWrites == 0
+                      ? Icons.check_circle
+                      : Icons.cloud_upload,
+                  color: status.pendingWrites == 0
+                      ? const Color(0xFF00C896)
+                      : Colors.amber,
+                  label: 'عمليات في انتظار الرفع',
+                  value: '${status.pendingWrites}',
+                ),
+                if (status.pendingWrites > 0) ...[
+                  const SizedBox(height: 10),
+                  const Text(
+                    'التعديلات دي محفوظة على الجهاز وهتترفع لوحدها أول ما الإنترنت يرجع.',
+                    style: TextStyle(fontSize: 12, color: Colors.amber),
+                  ),
+                ],
+                if (status.lastError != null) ...[
+                  const SizedBox(height: 10),
+                  Text(status.lastError!,
+                      style: const TextStyle(
+                          fontSize: 12, color: Colors.orangeAccent)),
+                ],
+                const Divider(height: 22),
+                const Text(
+                  'كل الأجهزة المسجلة على نفس مشروع Firebase بتشوف نفس البيانات لحظياً. أي تعديل بيتحفظ محلياً الأول، ولو النت قطع بيرجع يترفع لوحده أول ما الاتصال يرجع.',
+                  style: TextStyle(fontSize: 12, color: Colors.white70),
+                ),
+              ],
+            );
+          },
         ),
         actions: [
           TextButton(
@@ -1960,32 +2256,35 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
               widget.db.forceSyncNow();
               Navigator.pop(dialogCtx);
             },
-            child: const Text('بحث ومزامنة الآن'),
+            child: const Text('مزامنة الآن'),
           ),
           ElevatedButton(
             style: ElevatedButton.styleFrom(
                 backgroundColor: const Color(0xFF00C896),
                 foregroundColor: Colors.black),
-            onPressed: () async {
-              final ip = ipCtrl.text.trim();
-              Navigator.pop(dialogCtx);
-              if (ip.isNotEmpty) {
-                final ok = await widget.db.connectToPeerManual(ip);
-                if (mounted) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    SnackBar(
-                      content: Text(ok
-                          ? 'تم الاتصال والمزامنة مع $ip بنجاح!'
-                          : 'تعذر الوصول إلى $ip - تأكد إن الجهازين على نفس الواي فاي'),
-                    ),
-                  );
-                }
-              }
-            },
-            child: const Text('ربط مباشر'),
+            onPressed: () => Navigator.pop(dialogCtx),
+            child: const Text('تمام'),
           ),
         ],
       ),
+    );
+  }
+
+  Widget _cloudRow({
+    required IconData icon,
+    required Color color,
+    required String label,
+    required String value,
+  }) {
+    return Row(
+      children: [
+        Icon(icon, size: 18, color: color),
+        const SizedBox(width: 8),
+        Expanded(child: Text(label, style: const TextStyle(fontSize: 13))),
+        Text(value,
+            style: TextStyle(
+                fontSize: 13, fontWeight: FontWeight.bold, color: color)),
+      ],
     );
   }
 
@@ -2011,16 +2310,17 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                       initialData: widget.db.currentLogs,
                       stream: widget.db.streamAuditLogs(),
                       builder: (context, logsSnap) {
-                        return StreamBuilder<int>(
-                          initialData: widget.db.connectedPeersCount,
-                          stream: widget.db.streamConnectedPeersCount(),
-                          builder: (context, peersSnap) {
+                        return StreamBuilder<SyncStatus>(
+                          initialData: widget.db.currentSyncStatus,
+                          stream: widget.db.streamSyncStatus(),
+                          builder: (context, statusSnap) {
                             final tables = tablesSnap.data ?? [];
                             final inventory = invSnap.data ?? [];
                             final sales = salesSnap.data ?? [];
                             final expenses = expSnap.data ?? [];
                             final logs = logsSnap.data ?? [];
-                            final peersCount = peersSnap.data ?? 0;
+                            final syncStatus = statusSnap.data ??
+                                widget.db.currentSyncStatus;
 
                             final grossRevenue = sales.fold<double>(
                                 0.0, (sum, s) => sum + s.totalRevenue);
@@ -2053,7 +2353,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                                             padding: const EdgeInsets.symmetric(
                                                 horizontal: 10, vertical: 5),
                                             decoration: BoxDecoration(
-                                              color: peersCount > 0
+                                              color: syncStatus.isSynced
                                                   ? Colors.green
                                                       .withValues(alpha: 0.2)
                                                   : Colors.orange
@@ -2061,7 +2361,7 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                                               borderRadius:
                                                   BorderRadius.circular(10),
                                               border: Border.all(
-                                                  color: peersCount > 0
+                                                  color: syncStatus.isSynced
                                                       ? const Color(0xFF00C896)
                                                       : Colors.orangeAccent),
                                             ),
@@ -2069,23 +2369,33 @@ class _AdminDashboardShellState extends State<AdminDashboardShell> {
                                               mainAxisSize: MainAxisSize.min,
                                               children: [
                                                 Icon(
-                                                  peersCount > 0
-                                                      ? Icons.sync
-                                                      : Icons.sync_problem,
+                                                  syncStatus.isSynced
+                                                      ? Icons.cloud_done
+                                                      : (syncStatus.cloudReady
+                                                          ? Icons.cloud_upload
+                                                          : Icons.cloud_off),
                                                   size: 16,
-                                                  color: peersCount > 0
+                                                  color: syncStatus.isSynced
                                                       ? const Color(0xFF00C896)
                                                       : Colors.orangeAccent,
                                                 ),
                                                 const SizedBox(width: 6),
                                                 Text(
-                                                  peersCount > 0
-                                                      ? 'متصل ($peersCount)'
-                                                      : 'ربط الأجهزة',
+                                                  syncStatus.isSynced
+                                                      ? 'متزامن'
+                                                      : (!syncStatus.cloudReady
+                                                          ? 'غير متصل'
+                                                          : (!syncStatus.online
+                                                              ? (syncStatus
+                                                                          .pendingWrites >
+                                                                      0
+                                                                  ? 'أوفلاين - ${syncStatus.pendingWrites} بالانتظار'
+                                                                  : 'أوفلاين')
+                                                              : 'جارٍ الرفع (${syncStatus.pendingWrites})')),
                                                   style: TextStyle(
                                                     fontSize: 12,
                                                     fontWeight: FontWeight.bold,
-                                                    color: peersCount > 0
+                                                    color: syncStatus.isSynced
                                                         ? const Color(0xFF00C896)
                                                         : Colors.orangeAccent,
                                                   ),

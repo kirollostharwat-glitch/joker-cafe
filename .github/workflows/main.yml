@@ -19,6 +19,11 @@ jobs:
           flutter create . --platforms=windows,android --project-name=joker_cafe_pos
           Move-Item -Path "main_backup.dart" -Destination "lib/main.dart" -Force
           if (Test-Path "test/widget_test.dart") { Remove-Item "test/widget_test.dart" -Force }
+          if (Test-Path "android/app/build.gradle.kts") {
+            (Get-Content "android/app/build.gradle.kts" -Raw) -replace 'minSdk\s*=\s*flutter\.minSdkVersion', 'minSdk = 24' | Set-Content "android/app/build.gradle.kts" -NoNewline
+          } elseif (Test-Path "android/app/build.gradle") {
+            (Get-Content "android/app/build.gradle" -Raw) -replace 'minSdkVersion\s+flutter\.minSdkVersion', 'minSdkVersion 24' | Set-Content "android/app/build.gradle" -NoNewline
+          }
           flutter pub get
           dart run rename_app:main all="Joker Cafe"
           if (Test-Path "joker.png") { dart run flutter_launcher_icons }
@@ -41,6 +46,11 @@ jobs:
           flutter create . --platforms=android,windows --project-name=joker_cafe_pos
           mv -f main_backup.dart lib/main.dart
           rm -f test/widget_test.dart
+          if [ -f android/app/build.gradle.kts ]; then
+            sed -i 's/minSdk *= *flutter\.minSdkVersion/minSdk = 24/' android/app/build.gradle.kts
+          elif [ -f android/app/build.gradle ]; then
+            sed -i 's/minSdkVersion *= *flutter\.minSdkVersion/minSdkVersion 24/' android/app/build.gradle
+          fi
           flutter pub get
           dart run rename_app:main all="Joker Cafe"
           if [ -f "joker.png" ]; then dart run flutter_launcher_icons; fi

@@ -1,0 +1,16 @@
+rules_version = '2';
+
+// Joker Cafe - Firestore security rules
+// Paste this in Firebase Console -> Firestore Database -> Rules -> Publish.
+//
+// Every device signs in anonymously, so only clients that successfully
+// authenticated against YOUR project can read or write. Random people on the
+// internet cannot open your database even if they know the project id.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if request.auth != null;
+    }
+  }
+}
