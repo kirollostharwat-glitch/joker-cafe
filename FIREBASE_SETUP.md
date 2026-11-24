@@ -183,6 +183,7 @@ Install the new APK/EXE on **all** devices.
 | مفتاح Firebase غير صحيح | API key rejected | Check `firebase_options.dart`; if the key is restricted in Google Cloud Console → APIs & Services → Credentials, set Application restrictions to **None** (or allow the Windows app) |
 | Build fails: minSdk | Android minSdk too low | The workflow already forces `minSdk 24`; make sure you use the updated `.github/workflows/main.yml` |
 | Windows build: `C4238` treated as an error | Firebase Auth C++ plugin warning with `/WX` | The workflow now adds `/wd4238`; re-run the updated `Build Joker Cafe` workflow |
+| Android app opens then closes immediately | `MainActivity.kt` left in the old package after renaming | The workflow now moves it to `com.cafepos.cafe_pos`; re-run the updated `Build Joker Cafe` workflow and reinstall |
 
 ## Notes
 

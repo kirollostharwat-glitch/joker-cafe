@@ -24,6 +24,14 @@ jobs:
           } elseif (Test-Path "android/app/build.gradle") {
             (Get-Content "android/app/build.gradle" -Raw) -replace 'minSdkVersion\s+flutter\.minSdkVersion', 'minSdkVersion 24' -replace 'com\.example\.joker_cafe_pos', 'com.cafepos.cafe_pos' | Set-Content "android/app/build.gradle" -NoNewline
           }
+          $oldKotlin = "android/app/src/main/kotlin/com/example/joker_cafe_pos"
+          $newKotlin = "android/app/src/main/kotlin/com/cafepos/cafe_pos"
+          if (Test-Path $oldKotlin) {
+            New-Item -ItemType Directory -Force -Path $newKotlin | Out-Null
+            Move-Item -Path "$oldKotlin\MainActivity.kt" -Destination "$newKotlin\MainActivity.kt" -Force
+            (Get-Content "$newKotlin\MainActivity.kt" -Raw) -replace 'com\.example\.joker_cafe_pos', 'com.cafepos.cafe_pos' | Set-Content "$newKotlin\MainActivity.kt" -NoNewline
+            Remove-Item $oldKotlin -Recurse -Force
+          }
           flutter pub get
           dart run rename_app:main all="Joker Cafe"
           if (Test-Path "joker.png") { dart run flutter_launcher_icons }
@@ -55,6 +63,14 @@ jobs:
           elif [ -f android/app/build.gradle ]; then
             sed -i 's/minSdkVersion *= *flutter\.minSdkVersion/minSdkVersion 24/' android/app/build.gradle
             sed -i 's/com\.example\.joker_cafe_pos/com.cafepos.cafe_pos/g' android/app/build.gradle
+          fi
+          OLD_KOTLIN="android/app/src/main/kotlin/com/example/joker_cafe_pos"
+          NEW_KOTLIN="android/app/src/main/kotlin/com/cafepos/cafe_pos"
+          if [ -d "$OLD_KOTLIN" ]; then
+            mkdir -p "$NEW_KOTLIN"
+            mv -f "$OLD_KOTLIN/MainActivity.kt" "$NEW_KOTLIN/MainActivity.kt"
+            sed -i 's/com\.example\.joker_cafe_pos/com.cafepos.cafe_pos/g' "$NEW_KOTLIN/MainActivity.kt"
+            rm -rf "$OLD_KOTLIN"
           fi
           flutter pub get
           dart run rename_app:main all="Joker Cafe"
